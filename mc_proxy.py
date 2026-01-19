@@ -20,15 +20,43 @@ import threading
 import zlib
 import struct
 import time
-from mc_protocol import read_varint, write_varint, parse_packet, PACKET_IDS, read_string
+from mc_protocol import read_varint, write_varint, parse_packet, parse_client_packet, PACKET_IDS, read_string, read_float, read_double, read_ubyte
+
+# ============================================================
+# SHARED DATA FOR AIMBOT
+# ============================================================
+import json
+import os
+
+# Fichier JSON pour communication inter-processus avec l'aimbot
+SHARED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aimbot_data.json")
+
+shared_data = {
+    'my_position': {'x': 0, 'y': 0, 'z': 0, 'yaw': 0, 'pitch': 0},
+    'players': {},  # entity_id -> {x, y, z, uuid}
+    'lock': threading.Lock()
+}
+
+def export_to_file():
+    """Exporte les données vers le fichier JSON pour l'aimbot"""
+    try:
+        with shared_data['lock']:
+            data = {
+                'my_position': shared_data['my_position'].copy(),
+                'players': {str(k): v for k, v in shared_data['players'].items()}
+            }
+        with open(SHARED_FILE, 'w') as f:
+            json.dump(data, f)
+    except:
+        pass  # Ignorer les erreurs d'écriture
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 LOCAL_HOST = "0.0.0.0"
 LOCAL_PORT = 25566
-SERVER_HOST = "SKZ33.aternos.me"
-SERVER_PORT = 50048
+SERVER_HOST = "mc.dikingvps.com"
+SERVER_PORT = 25565
 # ============================================================
 
 
@@ -196,6 +224,13 @@ class MinecraftProxy:
             uuid_short = result.get('uuid', '?')[:8]
             print(f"\n>>> JOUEUR DÉTECTÉ: ID={result['entity_id']} UUID={uuid_short}...")
             print(f"    Position: X={result['x']:.1f} Y={result['y']:.1f} Z={result['z']:.1f}")
+            
+            # Sync to shared_data for aimbot
+            with shared_data['lock']:
+                shared_data['players'][result['entity_id']] = {
+                    'x': result['x'], 'y': result['y'], 'z': result['z'],
+                    'uuid': result.get('uuid', 'unknown')
+                }
         
         elif result['type'] == 'teleport':
             # Ne tracker que si c'est un joueur connu
@@ -205,6 +240,12 @@ class MinecraftProxy:
             )
             if ent:  # ent est None si ce n'est pas un joueur
                 print(f"\r[JOUEUR {result['entity_id']:3d}] X={result['x']:8.1f} Y={result['y']:5.1f} Z={result['z']:8.1f}  ", end="", flush=True)
+                # Sync to shared_data
+                with shared_data['lock']:
+                    if result['entity_id'] in shared_data['players']:
+                        shared_data['players'][result['entity_id']].update({
+                            'x': result['x'], 'y': result['y'], 'z': result['z']
+                        })
         
         elif result['type'] in ['position_delta', 'position_rotation_delta']:
             # Ne tracker que si c'est un joueur connu
@@ -214,6 +255,23 @@ class MinecraftProxy:
             )
             if ent:  # ent est None si ce n'est pas un joueur
                 print(f"\r[JOUEUR {result['entity_id']:3d}] X={ent['x']:8.1f} Y={ent['y']:5.1f} Z={ent['z']:8.1f}  ", end="", flush=True)
+                # Sync to shared_data
+                with shared_data['lock']:
+                    if result['entity_id'] in shared_data['players']:
+                        shared_data['players'][result['entity_id']].update({
+                            'x': ent['x'], 'y': ent['y'], 'z': ent['z']
+                        })
+        
+        elif result['type'] == 'my_position':
+            # Position du joueur local
+            with shared_data['lock']:
+                shared_data['my_position'].update({
+                    'x': result['x'], 'y': result['y'], 'z': result['z'],
+                    'yaw': result.get('yaw', 0), 'pitch': result.get('pitch', 0)
+                })
+        
+        # Exporter les données vers le fichier pour l'aimbot
+        export_to_file()
     
     def forward_client_to_server(self, client_socket, server_socket, state):
         """Transmet les données du client vers le serveur"""
@@ -269,6 +327,48 @@ class MinecraftProxy:
                                     if valid:
                                         state['username'] = name
                                         print(f"[LOGIN] Joueur: {name}")
+                    except:
+                        pass
+                
+                # Parser les paquets client en phase Play pour tracker l'orientation
+                if state['phase'] == 'play':
+                    try:
+                        compression_threshold = state.get('compression_threshold', -1)
+                        offset = 0
+                        plen, offset = read_varint(data, offset)
+                        if plen and plen > 0:
+                            packet_data = data[offset:offset + plen]
+                            p_offset = 0
+                            
+                            # Gérer la compression si activée
+                            if compression_threshold >= 0:
+                                data_length, p_offset = read_varint(packet_data, p_offset)
+                                if data_length and data_length > 0:
+                                    # Paquet compressé - décompresser
+                                    try:
+                                        packet_data = zlib.decompress(packet_data[p_offset:])
+                                        p_offset = 0
+                                    except:
+                                        pass  # Échec décompression, essayer sans
+                            
+                            # Lire l'ID du paquet
+                            pid, p_offset = read_varint(packet_data, p_offset)
+                            
+                            # Packets 0x04 (Player Position), 0x05 (Player Look), 0x06 (Player Position And Look)
+                            if pid in [0x04, 0x05, 0x06]:
+                                result = parse_client_packet(pid, packet_data[p_offset:])
+                                if result:
+                                    with shared_data['lock']:
+                                        # Mettre à jour la position si disponible
+                                        if 'x' in result:
+                                            shared_data['my_position']['x'] = result['x']
+                                            shared_data['my_position']['y'] = result['y']
+                                            shared_data['my_position']['z'] = result['z']
+                                        # Mettre à jour l'orientation si disponible
+                                        if 'yaw' in result:
+                                            shared_data['my_position']['yaw'] = result['yaw']
+                                            shared_data['my_position']['pitch'] = result['pitch']
+                                    export_to_file()
                     except:
                         pass
                 
@@ -332,6 +432,7 @@ class MinecraftProxy:
                                 elif pid == 0x03:  # Set Compression
                                     threshold, _ = read_varint(packet, offset)
                                     compression_threshold = threshold if threshold else -1
+                                    state['compression_threshold'] = compression_threshold  # Stocker dans state
                                     print(f"[INFO] Compression activée (seuil={compression_threshold})")
                                 elif pid == 0x02:  # Login Success
                                     state['phase'] = 'play'
