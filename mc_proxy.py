@@ -489,9 +489,13 @@ class MinecraftProxy:
                 # Parse packet
                 server_id, p = read_string(packet_data, p)
                 pubkey_len, p = read_varint(packet_data, p)
+                if pubkey_len is None:
+                    return None
                 public_key = packet_data[p:p + pubkey_len]
                 p += pubkey_len
                 verify_len, p = read_varint(packet_data, p)
+                if verify_len is None:
+                    return None
                 verify_token = packet_data[p:p + verify_len]
 
                 print(f"[CRYPTO] Server ID: '{server_id}'")
@@ -579,7 +583,7 @@ class MinecraftProxy:
                         # Handle compression
                         if compression >= 0:
                             dlen, p_off = read_varint(pkt, p_off)
-                            if dlen > 0:
+                            if dlen is not None and dlen > 0:
                                 try:
                                     pkt_content = zlib.decompress(pkt[p_off:])
                                     p_off = 0
@@ -662,18 +666,25 @@ class MinecraftProxy:
             client_data = client_socket.recv(4096)
             if client_data:
                 # Parse handshake to get next_state
+                off = 0
+                plen = 0
+                next_state = 2  # Default: assume login
                 try:
-                    off = 0
                     plen, off = read_varint(client_data, off)
-                    payload = client_data[off:off + plen]
-                    p = 0
-                    _, p = read_varint(payload, p)  # Packet ID
-                    _, p = read_varint(payload, p)  # Protocol
-                    _, p = read_string(payload, p)  # Address
-                    p += 2  # Port
-                    next_state, _ = read_varint(payload, p)
+                    if plen is None:
+                        plen = 0
+                    else:
+                        payload = client_data[off:off + plen]
+                        p = 0
+                        _, p = read_varint(payload, p)  # Packet ID
+                        _, p = read_varint(payload, p)  # Protocol
+                        _, p = read_string(payload, p)  # Address
+                        p += 2  # Port
+                        next_state_val, _ = read_varint(payload, p)
+                        if next_state_val is not None:
+                            next_state = next_state_val
                 except:
-                    next_state = 2  # Assume login
+                    pass
 
                 if next_state == 1:
                     # Status ping - transparent passthrough
@@ -704,7 +715,7 @@ class MinecraftProxy:
                             pass
 
                         # Send Login Start with authenticated username
-                        real_username = auth_data['username']
+                        real_username: str = auth_data['username']
                         login_payload = write_varint(0x00)
                         login_payload += write_varint(len(real_username.encode('utf-8')))
                         login_payload += real_username.encode('utf-8')
@@ -728,9 +739,9 @@ class MinecraftProxy:
                             print(f"[PROXY] Sent Set Compression to client (threshold={compression})")
 
                         # Send Login Success to client
-                        uuid_str = auth_data['uuid']
+                        uuid_str: str = auth_data['uuid']
                         uuid_formatted = f"{uuid_str[:8]}-{uuid_str[8:12]}-{uuid_str[12:16]}-{uuid_str[16:20]}-{uuid_str[20:]}"
-                        username = auth_data['username']
+                        username: str = auth_data['username']
 
                         login_success = write_varint(0x02)
                         login_success += write_varint(len(uuid_formatted)) + uuid_formatted.encode('utf-8')

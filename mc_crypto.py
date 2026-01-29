@@ -7,6 +7,7 @@ import os
 import hashlib
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
@@ -20,9 +21,11 @@ def generate_shared_secret():
     return os.urandom(16)
 
 
-def encrypt_with_public_key(public_key_der, data):
+def encrypt_with_public_key(public_key_der: bytes, data: bytes) -> bytes:
     """Encrypt data with server's RSA public key (PKCS1v15 padding)."""
     public_key = serialization.load_der_public_key(public_key_der, default_backend())
+    if not isinstance(public_key, RSAPublicKey):
+        raise ValueError("Expected RSA public key")
     return public_key.encrypt(data, padding.PKCS1v15())
 
 

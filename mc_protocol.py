@@ -159,6 +159,8 @@ def parse_packet(packet_id, data):
         dx, offset = read_byte(data, offset)
         dy, offset = read_byte(data, offset)
         dz, offset = read_byte(data, offset)
+        if dx is None or dy is None or dz is None:
+            return None
         return {
             'type': 'position_delta',
             'entity_id': entity_id,
@@ -175,6 +177,8 @@ def parse_packet(packet_id, data):
         dz, offset = read_byte(data, offset)
         yaw, offset = read_ubyte(data, offset)
         pitch, offset = read_ubyte(data, offset)
+        if dx is None or dy is None or dz is None or yaw is None or pitch is None:
+            return None
         return {
             'type': 'position_rotation_delta',
             'entity_id': entity_id,
@@ -193,6 +197,8 @@ def parse_packet(packet_id, data):
         z, offset = read_int(data, offset)
         yaw, offset = read_ubyte(data, offset)
         pitch, offset = read_ubyte(data, offset)
+        if x is None or y is None or z is None or yaw is None or pitch is None:
+            return None
         return {
             'type': 'teleport',
             'entity_id': entity_id,
@@ -210,6 +216,8 @@ def parse_packet(packet_id, data):
         x, offset = read_int(data, offset)
         y, offset = read_int(data, offset)
         z, offset = read_int(data, offset)
+        if x is None or y is None or z is None:
+            return None
         return {
             'type': 'spawn_player',
             'entity_id': entity_id,

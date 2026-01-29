@@ -19,8 +19,8 @@ import os
 
 # Windows API for mouse control
 try:
-    import win32api
-    import win32con
+    import win32api  # type: ignore[import-untyped]
+    import win32con  # type: ignore[import-untyped]
 except ImportError:
     print("[ERROR] pywin32 not installed. Run: pip install pywin32")
     sys.exit(1)
