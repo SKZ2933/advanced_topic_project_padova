@@ -280,7 +280,7 @@ def main():
         print(f"\n=== RESULT ===")
         print(f"Username: {result['username']}")
         print(f"UUID: {result['uuid']}")
-        access_token: str = result['access_token']
+        access_token = str(result['access_token'])
         print(f"Token: {access_token[:50]}...")
     except Exception as e:
         print(f"\n[ERROR] {e}")

@@ -19,11 +19,13 @@ import zlib
 import struct
 import json
 import os
+import signal
+import sys
 import requests
 
 from mc_protocol import (
     read_varint, write_varint, parse_packet, parse_client_packet,
-    PACKET_IDS, read_string, read_float, read_double, read_ubyte
+    PACKET_IDS, read_string
 )
 from auth_microsoft import MinecraftAuth
 from mc_crypto import (
@@ -693,7 +695,7 @@ class MinecraftProxy:
                     state['phase'] = 'status'
                 else:
                     # Login - full authentication
-                    handshake_len = off + plen
+                    handshake_len = off + (plen or 0)
                     trailing = client_data[handshake_len:]
                     handshake_pkt = client_data[:handshake_len]
 
@@ -715,7 +717,7 @@ class MinecraftProxy:
                             pass
 
                         # Send Login Start with authenticated username
-                        real_username: str = auth_data['username']
+                        real_username = str(auth_data['username'])
                         login_payload = write_varint(0x00)
                         login_payload += write_varint(len(real_username.encode('utf-8')))
                         login_payload += real_username.encode('utf-8')
@@ -739,9 +741,9 @@ class MinecraftProxy:
                             print(f"[PROXY] Sent Set Compression to client (threshold={compression})")
 
                         # Send Login Success to client
-                        uuid_str: str = auth_data['uuid']
+                        uuid_str = str(auth_data['uuid'])
                         uuid_formatted = f"{uuid_str[:8]}-{uuid_str[8:12]}-{uuid_str[12:16]}-{uuid_str[16:20]}-{uuid_str[20:]}"
-                        username: str = auth_data['username']
+                        username = str(auth_data['username'])
 
                         login_success = write_varint(0x02)
                         login_success += write_varint(len(uuid_formatted)) + uuid_formatted.encode('utf-8')
@@ -797,23 +799,46 @@ class MinecraftProxy:
         print(f"\n[*] In Minecraft, connect to: localhost:{self.local_port}")
         print("=" * 60)
 
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((self.local_host, self.local_port))
-        server.listen(5)
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.local_host, self.local_port))
+        self.server_socket.listen(5)
+        self.running = True
+
+        def signal_handler(sig, frame):
+            print("\n[*] Ctrl+C received, shutting down...")
+            self.running = False
+            try:
+                self.server_socket.close()
+            except:
+                pass
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, signal_handler)
 
         print(f"\n[+] Proxy listening on port {self.local_port}...")
-        print("[*] Waiting for Minecraft connection...\n")
+        print("[*] Waiting for Minecraft connection... (Ctrl+C to stop)\n")
 
         try:
-            while True:
-                client_socket, address = server.accept()
-                handler = threading.Thread(target=self.handle_client, args=(client_socket, address))
-                handler.daemon = True
-                handler.start()
+            while self.running:
+                self.server_socket.settimeout(1.0)
+                try:
+                    client_socket, address = self.server_socket.accept()
+                    handler = threading.Thread(target=self.handle_client, args=(client_socket, address))
+                    handler.daemon = True
+                    handler.start()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
         except KeyboardInterrupt:
+            pass
+        finally:
             print("\n[*] Proxy stopped.")
-            server.close()
+            try:
+                self.server_socket.close()
+            except:
+                pass
 
 
 # =============================================================================
