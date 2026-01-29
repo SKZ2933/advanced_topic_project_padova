@@ -1,125 +1,120 @@
 """
-AIMBOT PYTHON - CONTRÔLE SOURIS
-===============================
-Utilise les positions des joueurs capturées par mc_proxy.py
-pour orienter automatiquement la caméra vers un joueur cible.
+Minecraft Aimbot - Mouse Control Module
+Uses player positions captured by mc_proxy.py to automatically aim at targets.
 
-Basé sur la logique de AimLogic.java du projet AimbotMC.
+Based on the AimLogic from the AimbotMC Java mod.
 
-Raccourcis:
-- F6 : Activer/Désactiver l'aimbot
-- F7 : Changer de cible (joueur suivant)
-- ESC : Quitter
+Hotkeys:
+- O   : Toggle aimbot on/off
+- P   : Switch to next target
+- ESC : Quit
 """
 
 import math
 import time
-import threading
 import sys
 import random
+import json
+import os
 
-# Import Windows API pour contrôle souris
+# Windows API for mouse control
 try:
-    import win32api
-    import win32con
+    import win32api  # type: ignore[import-untyped]
+    import win32con  # type: ignore[import-untyped]
 except ImportError:
-    print("[ERREUR] pywin32 non installé. Exécutez: pip install pywin32")
+    print("[ERROR] pywin32 not installed. Run: pip install pywin32")
     sys.exit(1)
 
-# Import clavier pour les raccourcis
+# Keyboard for hotkeys
 try:
     import keyboard
 except ImportError:
-    print("[ERREUR] keyboard non installé. Exécutez: pip install keyboard")
+    print("[ERROR] keyboard not installed. Run: pip install keyboard")
     sys.exit(1)
 
 
+# =============================================================================
+# AIM LOGIC (ported from Java)
+# =============================================================================
+
 class AimLogic:
     """
-    Port Python de AimLogic.java
-    Calcule les angles yaw et pitch pour viser une cible
+    Calculates yaw and pitch angles to look at a target.
+    Ported from AimLogic.java in AimbotMC.
     """
     
-    # Hauteur des yeux du joueur (position Y + eye_height)
-    PLAYER_EYE_HEIGHT = 1.62
-    # Offset pour viser la tête de la cible
-    TARGET_HEAD_OFFSET = 1.4
-    
+    PLAYER_EYE_HEIGHT = 1.62   # Player eye position offset
+    TARGET_HEAD_OFFSET = 1.4   # Aim at target's head center
+
     @staticmethod
     def get_rotations(player_x, player_y, player_z, target_x, target_y, target_z):
         """
-        Calcule le yaw et pitch pour regarder vers la cible
+        Calculate yaw and pitch to look from player position to target.
         
-        Args:
-            player_x, player_y, player_z: Position du joueur local
-            target_x, target_y, target_z: Position de la cible
-            
         Returns:
-            tuple: (yaw, pitch) en degrés
+            tuple: (yaw, pitch) in degrees
         """
-        # Position des yeux du joueur
+        # Player eye position
         eye_y = player_y + AimLogic.PLAYER_EYE_HEIGHT
         
-        # Différence de position vers la cible (centre de la tête)
+        # Direction to target's head
         diff_x = target_x - player_x
         diff_y = (target_y + AimLogic.TARGET_HEAD_OFFSET) - eye_y
         diff_z = target_z - player_z
         
-        # Distance horizontale
+        # Horizontal distance
         diff_xz = math.sqrt(diff_x * diff_x + diff_z * diff_z)
         
-        # Calcul des angles (identique à Java)
-        # atan2(z, x) donne l'angle dans le plan XZ
-        # -90° car Minecraft utilise un système où 0° = Sud
+        # Calculate angles (Minecraft: 0° = South, yaw increases counter-clockwise)
         yaw = math.degrees(math.atan2(diff_z, diff_x)) - 90.0
-        
-        # Pitch: angle vertical (négatif car regarder vers le haut = pitch négatif)
         pitch = -math.degrees(math.atan2(diff_y, diff_xz))
         
         return yaw, pitch
-    
+
     @staticmethod
     def normalize_angle(angle):
-        """Normalise un angle entre -180 et 180 degrés"""
+        """Normalize angle to [-180, 180] range."""
         while angle > 180:
             angle -= 360
         while angle < -180:
             angle += 360
         return angle
-    
+
     @staticmethod
     def get_angle_delta(current, target):
-        """Calcule le delta entre deux angles (chemin le plus court)"""
-        delta = target - current
-        return AimLogic.normalize_angle(delta)
+        """Get shortest rotation delta between two angles."""
+        return AimLogic.normalize_angle(target - current)
 
+
+# =============================================================================
+# HUMANIZED AIM (Anti-Detection)
+# =============================================================================
 
 class HumanizedAim:
     """
-    Système de lissage humanisé pour éviter la détection par anti-cheat.
+    Makes aim movements look human-like to avoid anti-cheat detection.
     
-    Techniques utilisées:
-    - Courbes de Bézier quadratiques pour trajectoires naturelles
-    - Profil d'accélération ease-in-out (sigmoidale)
-    - Bruit gaussien pour imperfections
-    - Délai de réaction humain simulé
-    - Oscillation autour de la cible (overshoot)
+    Techniques used:
+    - Bezier curves for natural trajectories
+    - Ease-in-out acceleration profile
+    - Gaussian noise for imperfection
+    - Simulated reaction delay
+    - Mouse saccades (simulates lifting mouse at edge of mousepad)
     """
-    
+
     def __init__(self):
-        # Configuration du lissage - AJUSTÉ pour meilleure réactivité
-        self.smoothing_factor = 0.35  # Augmenté: plus rapide mais toujours naturel
-        self.noise_amplitude = 0.4    # Degrés de bruit max (réduit un peu)
-        self.overshoot_chance = 0.10  # 10% de chance de dépasser
-        self.overshoot_amount = 0.05  # 5% de dépassement
+        # Smoothing parameters
+        self.smoothing_factor = 0.35   # Movement speed (higher = faster)
+        self.noise_amplitude = 0.4     # Random jitter in degrees
+        self.overshoot_chance = 0.10   # 10% chance to overshoot target
+        self.overshoot_amount = 0.05   # 5% overshoot distance
         
-        # État du mouvement courant
+        # Current aim state
         self.is_aiming = False
         self.aim_start_time = 0
         self.reaction_delay = 0
-        self.movement_progress = 0
         
-        # Points de la courbe de Bézier
+        # Bezier curve points
         self.start_yaw = 0
         self.start_pitch = 0
         self.control_yaw = 0
@@ -127,134 +122,84 @@ class HumanizedAim:
         self.target_yaw = 0
         self.target_pitch = 0
         
-        # Dernière cible pour détecter les changements
+        # Target tracking
         self.last_target_id = None
         
-        # === SACCADES (simulation bord de tapis) ===
-        self.saccade_chance = 0.01        # 1% de chance par frame de déclencher une saccade
-        self.saccade_active = False       # Une saccade est en cours
-        self.saccade_end_time = 0         # Fin de la saccade
-        self.saccade_duration_min = 0.04  # 40ms min
-        self.saccade_duration_max = 0.06  # 60ms max
-        self.accumulated_movement = 0     # Mouvement accumulé (simule la distance sur le tapis)
-        self.saccade_threshold = 40       # Degrés avant saccade probable
-    
-    def generate_reaction_delay(self):
-        """Génère un délai de réaction humain aléatoire (50-120ms) - réduit pour réactivité"""
+        # Saccade simulation (mousepad edge lift)
+        self.saccade_chance = 0.01
+        self.saccade_active = False
+        self.saccade_end_time = 0
+        self.accumulated_movement = 0
+        self.saccade_threshold = 40  # Degrees before saccade likely
+
+    def _generate_reaction_delay(self):
+        """Human reaction time: 50-120ms."""
         return random.uniform(0.05, 0.12)
-    
-    def generate_control_point(self, start, target):
-        """
-        Génère un point de contrôle pour la courbe de Bézier.
-        Ajoute une déviation naturelle au milieu du trajet.
-        """
+
+    def _generate_control_point(self, start, target):
+        """Generate Bezier control point with natural deviation."""
         midpoint = (start + target) / 2
-        # Déviation de ±15° maximum, proportionnelle à la distance
-        distance = abs(target - start)
-        max_deviation = min(15, distance * 0.3)
-        deviation = random.uniform(-max_deviation, max_deviation)
-        return midpoint + deviation
-    
-    def ease_in_out(self, t):
-        """
-        Fonction d'accélération ease-in-out (sigmoidale).
-        Démarre lent, accélère au milieu, ralentit à la fin.
-        
-        Args:
-            t: Progression de 0 à 1
-        Returns:
-            Valeur transformée entre 0 et 1
-        """
+        max_deviation = min(15, abs(target - start) * 0.3)
+        return midpoint + random.uniform(-max_deviation, max_deviation)
+
+    def _ease_in_out(self, t):
+        """Sigmoid-like acceleration curve: slow start, fast middle, slow end."""
         if t < 0.5:
-            # Ease-in: accélération
             return 2 * t * t
-        else:
-            # Ease-out: décélération
-            return 1 - pow(-2 * t + 2, 2) / 2
-    
-    def bezier_quadratic(self, t, p0, p1, p2):
+        return 1 - pow(-2 * t + 2, 2) / 2
+
+    def _add_noise(self, value):
+        """Add Gaussian noise for imperfect aim."""
+        return value + random.gauss(0, self.noise_amplitude * 0.4)
+
+    def _check_saccade(self, move_yaw, move_pitch):
         """
-        Calcule un point sur une courbe de Bézier quadratique.
-        
-        Args:
-            t: Progression (0-1)
-            p0: Point de départ
-            p1: Point de contrôle
-            p2: Point d'arrivée
-        """
-        inv_t = 1 - t
-        return inv_t * inv_t * p0 + 2 * inv_t * t * p1 + t * t * p2
-    
-    def add_gaussian_noise(self, value):
-        """Ajoute du bruit gaussien pour des imperfections naturelles"""
-        noise = random.gauss(0, self.noise_amplitude * 0.4)
-        return value + noise
-    
-    def check_saccade(self, move_yaw, move_pitch):
-        """
-        Vérifie et gère les saccades (simulation bord de tapis).
-        
-        Quand le joueur atteint le bord de son tapis, il doit lever la souris
-        et la replacer, causant une brève pause + léger décalage.
-        
-        Returns:
-            tuple: (move_yaw, move_pitch, is_paused) - mouvement modifié et état de pause
+        Simulate mouse saccade (lifting mouse at mousepad edge).
+        Returns (move_yaw, move_pitch, is_paused).
         """
         current_time = time.time()
         
-        # Si une saccade est en cours, on pause le mouvement
+        # During saccade: no movement
         if self.saccade_active:
             if current_time < self.saccade_end_time:
-                # Pendant la saccade: pas de mouvement (souris levée)
                 return 0, 0, True
-            else:
-                # Fin de la saccade: reset et petit décalage de "replacement"
-                self.saccade_active = False
-                self.accumulated_movement = 0
-                # Petit mouvement de correction aléatoire (replacement imparfait)
-                correction_yaw = random.uniform(-1.5, 1.5)
-                correction_pitch = random.uniform(-0.5, 0.5)
-                return move_yaw + correction_yaw, move_pitch + correction_pitch, False
+            # End saccade with small correction
+            self.saccade_active = False
+            self.accumulated_movement = 0
+            correction_yaw = random.uniform(-1.5, 1.5)
+            correction_pitch = random.uniform(-0.5, 0.5)
+            return move_yaw + correction_yaw, move_pitch + correction_pitch, False
         
-        # Accumuler le mouvement
-        movement_magnitude = math.sqrt(move_yaw**2 + move_pitch**2)
-        self.accumulated_movement += movement_magnitude
+        # Accumulate movement
+        self.accumulated_movement += math.sqrt(move_yaw**2 + move_pitch**2)
         
-        # Vérifier si on déclenche une saccade
-        # Plus on a bougé, plus la chance augmente
-        saccade_probability = self.saccade_chance
+        # Check if saccade should trigger
+        probability = self.saccade_chance
         if self.accumulated_movement > self.saccade_threshold:
-            # Augmenter la probabilité au-delà du seuil
-            saccade_probability = min(0.15, self.saccade_chance * (self.accumulated_movement / self.saccade_threshold))
+            probability = min(0.15, self.saccade_chance * (self.accumulated_movement / self.saccade_threshold))
         
-        if random.random() < saccade_probability and self.accumulated_movement > 15:
-            # Déclencher une saccade
+        if random.random() < probability and self.accumulated_movement > 15:
             self.saccade_active = True
-            duration = random.uniform(self.saccade_duration_min, self.saccade_duration_max)
-            self.saccade_end_time = current_time + duration
-            return 0, 0, True  # Premier frame de saccade: pas de mouvement
+            self.saccade_end_time = current_time + random.uniform(0.04, 0.06)
+            return 0, 0, True
         
         return move_yaw, move_pitch, False
-    
-    def start_new_aim(self, current_yaw, current_pitch, target_yaw, target_pitch, target_id=None):
-        """
-        Démarre un nouveau mouvement de visée avec délai de réaction.
-        """
-        # Si c'est une nouvelle cible, simuler un délai de réaction
+
+    def _start_new_aim(self, current_yaw, current_pitch, target_yaw, target_pitch, target_id):
+        """Initialize a new aim movement with reaction delay."""
         if target_id != self.last_target_id:
-            self.reaction_delay = self.generate_reaction_delay()
+            self.reaction_delay = self._generate_reaction_delay()
             self.aim_start_time = time.time()
             self.last_target_id = target_id
             self.is_aiming = True
-            self.movement_progress = 0
             
-            # Initialiser la courbe de Bézier
+            # Setup Bezier curve
             self.start_yaw = current_yaw
             self.start_pitch = current_pitch
-            self.control_yaw = self.generate_control_point(current_yaw, target_yaw)
-            self.control_pitch = self.generate_control_point(current_pitch, target_pitch)
+            self.control_yaw = self._generate_control_point(current_yaw, target_yaw)
+            self.control_pitch = self._generate_control_point(current_pitch, target_pitch)
             
-            # Appliquer overshoot potentiel
+            # Optional overshoot
             if random.random() < self.overshoot_chance:
                 overshoot = 1 + self.overshoot_amount
                 self.target_yaw = current_yaw + (target_yaw - current_yaw) * overshoot
@@ -262,193 +207,162 @@ class HumanizedAim:
             else:
                 self.target_yaw = target_yaw
                 self.target_pitch = target_pitch
-    
+
     def get_humanized_movement(self, current_yaw, current_pitch, target_yaw, target_pitch, target_id=None):
         """
-        Calcule le mouvement humanisé à appliquer.
+        Calculate humanized mouse movement.
         
         Returns:
-            tuple: (delta_yaw, delta_pitch) à appliquer, ou (0, 0) si en délai
+            tuple: (delta_yaw, delta_pitch) to apply, or (0, 0) if waiting
         """
-        current_time = time.time()
-        
-        # Vérifier si nouvelle cible
+        # Check for new target
         if target_id != self.last_target_id or not self.is_aiming:
-            self.start_new_aim(current_yaw, current_pitch, target_yaw, target_pitch, target_id)
+            self._start_new_aim(current_yaw, current_pitch, target_yaw, target_pitch, target_id)
         
-        # Vérifier le délai de réaction
-        elapsed = current_time - self.aim_start_time
+        # Wait for reaction delay
+        elapsed = time.time() - self.aim_start_time
         if elapsed < self.reaction_delay:
-            return 0, 0  # Encore en délai de réaction
+            return 0, 0
         
-        # Calculer le delta restant
+        # Update target (for moving targets)
+        self.target_yaw = target_yaw
+        self.target_pitch = target_pitch
+        
+        # Calculate remaining delta
         delta_yaw = AimLogic.get_angle_delta(current_yaw, target_yaw)
         delta_pitch = target_pitch - current_pitch
         distance = math.sqrt(delta_yaw**2 + delta_pitch**2)
         
-        # Si très proche, arrêter
+        # Close enough - stop aiming
         if distance < 0.5:
             self.is_aiming = False
             return 0, 0
         
-        # Appliquer le profil d'accélération - AJUSTÉ pour meilleure réactivité
-        # La vitesse dépend de la distance: plus loin = plus rapide
+        # Speed based on distance
         if distance > 30:
-            speed_mult = 0.7  # Grandes distances: rapide
+            speed_mult = 0.7   # Long distance: fast
         elif distance > 10:
-            speed_mult = 1.0  # Moyennes distances: vitesse max
+            speed_mult = 1.0   # Medium: full speed
         else:
-            speed_mult = 0.6  # Petites distances: précision (mais pas trop lent)
+            speed_mult = 0.6   # Close: precise
         
-        # Calculer le mouvement avec lissage
+        # Apply smoothing
         smooth_factor = self.smoothing_factor * speed_mult
         move_yaw = delta_yaw * smooth_factor
         move_pitch = delta_pitch * smooth_factor
         
-        # Ajouter du bruit gaussien
-        move_yaw = self.add_gaussian_noise(move_yaw)
-        move_pitch = self.add_gaussian_noise(move_pitch)
+        # Add noise
+        move_yaw = self._add_noise(move_yaw)
+        move_pitch = self._add_noise(move_pitch)
         
-        # Variation aléatoire de la vitesse (±20%)
-        speed_variation = random.uniform(0.8, 1.2)
-        move_yaw *= speed_variation
-        move_pitch *= speed_variation
+        # Random speed variation (±20%)
+        speed_var = random.uniform(0.8, 1.2)
+        move_yaw *= speed_var
+        move_pitch *= speed_var
         
-        # Appliquer les saccades (simulation bord de tapis)
-        move_yaw, move_pitch, is_saccade = self.check_saccade(move_yaw, move_pitch)
+        # Apply saccades
+        move_yaw, move_pitch, _ = self._check_saccade(move_yaw, move_pitch)
         
         return move_yaw, move_pitch
 
 
+# =============================================================================
+# MOUSE CONTROLLER
+# =============================================================================
+
 class MouseController:
-    """
-    Contrôle la souris Windows pour orienter la caméra Minecraft
-    """
-    
+    """Controls Windows mouse to move Minecraft camera."""
+
     def __init__(self):
-        """
-        Minecraft utilise environ 0.15 degrés par pixel de mouvement souris
-        (avec sensibilité par défaut = 0.5 dans les options)
-        """
-        # Facteur: combien de degrés par pixel de mouvement souris
-        # Valeur Minecraft par défaut ≈ 0.15 (peut varier selon sensibilité in-game)
+        # Minecraft sensitivity: ~0.15 degrees per pixel (default sensitivity 0.5)
         self.mc_sensitivity = 0.50
-    
+
     def move_relative(self, delta_yaw, delta_pitch):
-        """
-        Déplace la souris pour tourner de delta_yaw/delta_pitch degrés
-        
-        Args:
-            delta_yaw: Rotation horizontale désirée en degrés
-            delta_pitch: Rotation verticale désirée en degrés
-        """
-        # Convertir degrés en pixels: pixels = degrés / sensibilité_mc
+        """Move mouse to rotate camera by specified degrees."""
+        # Convert degrees to pixels
         pixels_x = int(delta_yaw / self.mc_sensitivity)
         pixels_y = int(delta_pitch / self.mc_sensitivity)
         
-        # Limiter les mouvements pour éviter les snaps violents
+        # Limit movement to prevent snapping
         max_move = 50
         pixels_x = max(-max_move, min(max_move, pixels_x))
         pixels_y = max(-max_move, min(max_move, pixels_y))
         
         if pixels_x != 0 or pixels_y != 0:
             win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, pixels_x, pixels_y, 0, 0)
-    
-    def smooth_aim(self, delta_yaw, delta_pitch, smoothing=0.3):
-        """
-        Applique un lissage pour des mouvements plus naturels
-        
-        Args:
-            delta_yaw: Delta yaw en degrés
-            delta_pitch: Delta pitch en degrés
-            smoothing: Facteur de lissage (0-1, plus petit = plus lent)
-        """
-        # Appliquer seulement une fraction du mouvement
-        smooth_yaw = delta_yaw * smoothing
-        smooth_pitch = delta_pitch * smoothing
-        
-        self.move_relative(smooth_yaw, smooth_pitch)
 
 
-import json
-import os
+# =============================================================================
+# AIMBOT MAIN CLASS
+# =============================================================================
 
 class Aimbot:
-    """
-    Aimbot principal qui combine tracking et contrôle souris
-    """
-    
-    # Fichier JSON partagé avec le proxy
+    """Main aimbot controller - reads positions from proxy and aims at targets."""
+
     SHARED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aimbot_data.json")
-    
+
     def __init__(self):
         self.enabled = False
         self.running = True
         self.mouse = MouseController()
-        self.humanizer = HumanizedAim()  # Système de lissage anti-détection
+        self.humanizer = HumanizedAim()
         self.target_entity_id = None
-        
-        # Configuration
         self.update_rate = 144  # Hz
-        self.max_fov = 180  # Degrés - angle max pour lock
         
-        # Cache des données
+        # Cached data from proxy
         self._cached_data = {
             'my_position': {'x': 0, 'y': 0, 'z': 0, 'yaw': 0, 'pitch': 0},
             'players': {}
         }
         
-        print(f"[*] Fichier de données: {self.SHARED_FILE}")
-        print(f"[*] Lissage humanisé activé (anti-détection)")
-    
+        print(f"[*] Data file: {self.SHARED_FILE}")
+        print(f"[*] Humanized aim enabled (anti-detection)")
+
     def _read_shared_data(self):
-        """Lit les données depuis le fichier JSON partagé"""
+        """Read player positions from JSON file (written by proxy)."""
         try:
             if os.path.exists(self.SHARED_FILE):
                 with open(self.SHARED_FILE, 'r') as f:
-                    data = json.load(f)
-                    self._cached_data = data
+                    self._cached_data = json.load(f)
                     return True
         except (json.JSONDecodeError, IOError):
             pass
         return False
-    
-    def get_my_position(self):
-        """Récupère la position du joueur local"""
+
+    def _get_my_position(self):
+        """Get local player position and rotation."""
         self._read_shared_data()
         return self._cached_data.get('my_position', {'x': 0, 'y': 0, 'z': 0, 'yaw': 0, 'pitch': 0})
-    
-    def get_players(self):
-        """Récupère la liste des joueurs"""
+
+    def _get_players(self):
+        """Get dictionary of other players."""
         self._read_shared_data()
         return self._cached_data.get('players', {})
-    
-    def find_closest_player(self, my_pos):
-        """Trouve le joueur le plus proche"""
-        players = self.get_players()
+
+    def _find_closest_player(self, my_pos):
+        """Find the nearest player to us."""
+        players = self._get_players()
         if not players:
             return None, None
         
         closest_id = None
         closest_dist = float('inf')
         
-        for eid, pdata in players.items():
-            dx = pdata['x'] - my_pos['x']
-            dy = pdata['y'] - my_pos['y']
-            dz = pdata['z'] - my_pos['z']
+        for entity_id, player_data in players.items():
+            dx = player_data['x'] - my_pos['x']
+            dy = player_data['y'] - my_pos['y']
+            dz = player_data['z'] - my_pos['z']
             dist = math.sqrt(dx*dx + dy*dy + dz*dz)
             
             if dist < closest_dist:
                 closest_dist = dist
-                closest_id = eid
+                closest_id = entity_id
         
-        if closest_id:
-            return closest_id, players[closest_id]
-        return None, None
-    
-    def get_next_target(self):
-        """Passe au joueur suivant"""
-        players = self.get_players()
+        return closest_id, players.get(closest_id) if closest_id else None
+
+    def _next_target(self):
+        """Switch to next player target."""
+        players = self._get_players()
         if not players:
             self.target_entity_id = None
             return
@@ -463,20 +377,20 @@ class Aimbot:
         
         target = players.get(self.target_entity_id)
         if target:
-            uuid_short = target.get('uuid', '?')[:8] if 'uuid' in target else '?'
-            print(f"[CIBLE] Joueur ID={self.target_entity_id} UUID={uuid_short}...")
-    
-    def aim_at_target(self):
-        """Effectue un cycle de visée - TRACKING EN TEMPS RÉEL"""
+            uuid_short = target.get('uuid', '?')[:8]
+            print(f"[TARGET] Player ID={self.target_entity_id} UUID={uuid_short}...")
+
+    def _aim_at_target(self):
+        """Perform one aim cycle."""
         if not self.enabled:
             return
         
-        my_pos = self.get_my_position()
-        players = self.get_players()
+        my_pos = self._get_my_position()
+        players = self._get_players()
         
-        # Si pas de cible ou cible invalide, prendre le plus proche
+        # Auto-select closest if no target
         if self.target_entity_id is None or self.target_entity_id not in players:
-            self.target_entity_id, _ = self.find_closest_player(my_pos)
+            self.target_entity_id, _ = self._find_closest_player(my_pos)
         
         if self.target_entity_id is None:
             return
@@ -485,62 +399,54 @@ class Aimbot:
         if not target:
             return
         
-        # Calculer l'angle DÉSIRÉ vers la cible (où on DEVRAIT regarder)
+        # Calculate ideal aim angles
         target_yaw, target_pitch = AimLogic.get_rotations(
             my_pos['x'], my_pos['y'], my_pos['z'],
             target['x'], target['y'], target['z']
         )
         
-        # Orientation ACTUELLE du joueur (en temps réel depuis le proxy)
+        # Current camera angles
         current_yaw = my_pos.get('yaw', 0)
         current_pitch = my_pos.get('pitch', 0)
         
-        # Utiliser le système de lissage humanisé (anti-détection)
-        # Calcule un mouvement naturel avec:
-        # - Délai de réaction humain
-        # - Courbe de vitesse ease-in-out
-        # - Bruit gaussien
-        # - Variation aléatoire
+        # Get humanized movement
         move_yaw, move_pitch = self.humanizer.get_humanized_movement(
             current_yaw, current_pitch,
             target_yaw, target_pitch,
             target_id=self.target_entity_id
         )
         
-        # DEBUG: afficher les valeurs
+        # Debug output
         delta_yaw = AimLogic.get_angle_delta(current_yaw, target_yaw)
         delta_pitch = target_pitch - current_pitch
-        print(f"\r[HUMANIZED] delta=({delta_yaw:.1f}°, {delta_pitch:.1f}°) move=({move_yaw:.2f}, {move_pitch:.2f})  ", end="", flush=True)
+        print(f"\r[AIM] delta=({delta_yaw:.1f}°, {delta_pitch:.1f}°) move=({move_yaw:.2f}, {move_pitch:.2f})  ", end="", flush=True)
         
-        # Si aucun mouvement (en délai de réaction ou proche de la cible)
-        if move_yaw == 0 and move_pitch == 0:
-            return
-        
-        # Appliquer le mouvement de souris humanisé
-        self.mouse.move_relative(move_yaw, move_pitch)
-    
-    def toggle(self):
-        """Active/désactive l'aimbot"""
+        # Apply movement
+        if move_yaw != 0 or move_pitch != 0:
+            self.mouse.move_relative(move_yaw, move_pitch)
+
+    def _toggle(self):
+        """Toggle aimbot on/off."""
         self.enabled = not self.enabled
-        status = "ACTIVÉ" if self.enabled else "DÉSACTIVÉ"
+        status = "ENABLED" if self.enabled else "DISABLED"
         print(f"\n[AIMBOT] {status}")
-    
+
     def run(self):
-        """Boucle principale"""
+        """Main loop."""
         print("\n" + "=" * 50)
-        print("AIMBOT PYTHON - MINECRAFT 1.8.9")
+        print("MINECRAFT AIMBOT - Version 1.8.9")
         print("=" * 50)
-        print("\nRaccourcis:")
-        print("  O   - Activer/Désactiver l'aimbot")
-        print("  P   - Changer de cible")
-        print("  ESC - Quitter")
-        print("\n[*] En attente de données du proxy...")
-        print("    Connectez-vous à Minecraft via le proxy")
+        print("\nHotkeys:")
+        print("  O   - Toggle aimbot on/off")
+        print("  P   - Switch target")
+        print("  ESC - Quit")
+        print("\n[*] Waiting for proxy data...")
+        print("    Connect to Minecraft via the proxy")
         print("=" * 50 + "\n")
         
-        # Configurer les raccourcis clavier
-        keyboard.on_press_key('o', lambda _: self.toggle())
-        keyboard.on_press_key('p', lambda _: self.get_next_target())
+        # Setup hotkeys
+        keyboard.on_press_key('o', lambda _: self._toggle())
+        keyboard.on_press_key('p', lambda _: self._next_target())
         
         interval = 1.0 / self.update_rate
         
@@ -548,12 +454,10 @@ class Aimbot:
             while self.running:
                 start = time.perf_counter()
                 
-                # Afficher le statut périodiquement
-                players = self.get_players()
-                if players and self.enabled:
-                    self.aim_at_target()
+                if self._get_players() and self.enabled:
+                    self._aim_at_target()
                 
-                # Maintenir le framerate
+                # Maintain framerate
                 elapsed = time.perf_counter() - start
                 if elapsed < interval:
                     time.sleep(interval - elapsed)
@@ -562,13 +466,17 @@ class Aimbot:
             pass
         finally:
             keyboard.unhook_all()
-            print("\n[*] Aimbot arrêté.")
+            print("\n[*] Aimbot stopped.")
 
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
 
 def main():
-    print("[*] Démarrage de l'aimbot...")
-    print("[!] IMPORTANT: Le proxy mc_proxy.py doit être lancé en premier!")
-    print("[!] Puis connectez Minecraft à localhost:25566")
+    print("[*] Starting aimbot...")
+    print("[!] IMPORTANT: mc_proxy.py must be running first!")
+    print("[!] Then connect Minecraft to localhost:25566")
     print()
     
     aimbot = Aimbot()
