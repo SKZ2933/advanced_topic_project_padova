@@ -27,12 +27,16 @@ class MinecraftAuth:
     """Handles the complete Microsoft -> Minecraft authentication flow."""
 
     def __init__(self):
-        self.microsoft_token = None
-        self.xbox_token = None
+        self.microsoft_token = None # Step 1. : Proves you own the Microsoft account
+        
+        self.xbox_token = None # Step 2. : Check if this microsoft account bought minecraft
         self.xbox_user_hash = None
-        self.xsts_token = None
-        self.minecraft_token = None
-        self.uuid = None
+
+        self.xsts_token = None # Step 3. : Check if we can access minecraft services
+        
+        self.minecraft_token = None # Step 4. : Retreive the minecraft token that servers needs
+    
+        self.uuid = None # Step 5. : Retreive additional informations about minecraft account
         self.username = None
 
     def authenticate(self, force_refresh=False):
@@ -266,25 +270,3 @@ class MinecraftAuth:
         except:
             pass
         return False
-
-
-# =============================================================================
-# STANDALONE TEST
-# =============================================================================
-
-def main():
-    """Test authentication flow."""
-    auth = MinecraftAuth()
-    try:
-        result = auth.authenticate()
-        print(f"\n=== RESULT ===")
-        print(f"Username: {result['username']}")
-        print(f"UUID: {result['uuid']}")
-        access_token = str(result['access_token'])
-        print(f"Token: {access_token[:50]}...")
-    except Exception as e:
-        print(f"\n[ERROR] {e}")
-
-
-if __name__ == "__main__":
-    main()

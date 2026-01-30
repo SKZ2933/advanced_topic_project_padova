@@ -1,6 +1,34 @@
 """
 Minecraft Encryption Module
 Handles RSA and AES-128-CFB8 encryption for online-mode server connections.
+
+Encryption Flow:
+================
+
+1. Server sends Encryption Request:
+   - server_id (empty string for modern servers)
+   - public_key (DER-encoded RSA public key)
+   - verify_token (4 random bytes)
+
+2. Client generates shared_secret:
+   - 16 random bytes (will become AES key + IV)
+
+3. Client authenticates with Mojang:
+   - Computes server_hash = SHA1(server_id + shared_secret + public_key)
+   - Calls POST sessionserver.mojang.com/session/minecraft/join
+   - Returns 204 No Content (no data) — just registers the session
+   - Server later calls hasJoined endpoint to verify we did this
+
+4. Client sends Encryption Response:
+   - shared_secret encrypted with server's RSA public key
+   - verify_token encrypted with server's RSA public key
+
+5. Both sides enable AES-128-CFB8:
+   - Key = shared_secret
+   - IV = shared_secret (yes, same value)
+   - All subsequent traffic is encrypted
+
+After step 5, use EncryptedSocketWrapper to transparently handle encryption.
 """
 
 import os
