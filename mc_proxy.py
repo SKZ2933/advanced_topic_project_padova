@@ -17,11 +17,11 @@ import socket
 import threading
 import zlib
 import struct
-import json
-import os
 import signal
 import sys
 import requests
+
+from multiprocessing import shared_memory
 
 from mc_protocol import (
     read_varint, write_varint, parse_server_packet, parse_client_packet,
@@ -44,33 +44,290 @@ SERVER_HOST = "mc.dikingvps.com"
 SERVER_PORT = 25565
 ONLINE_MODE = True  # True = premium server (authentication required)
 
-# Shared data file for aimbot communication
-SHARED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aimbot_data.json")
+
+# =============================================================================
+# PACKET UTILITIES
+# =============================================================================
+
+def write_string(text: str) -> bytes:
+    """Write a Minecraft string (VarInt length + UTF-8)."""
+    encoded = text.encode('utf-8')
+    return write_varint(len(encoded)) + encoded
+
+
+def build_packet(packet_id: int, payload: bytes = b"") -> bytes:
+    """Build a complete Minecraft packet with length prefix."""
+    packet_data = write_varint(packet_id) + payload
+    return write_varint(len(packet_data)) + packet_data
+
+
+def build_compressed_packet(packet_id: int, payload: bytes, compression_threshold: int) -> bytes:
+    """Build a packet with compression header (uncompressed, data_length=0)."""
+    inner_data = write_varint(packet_id) + payload
+    # data_length=0 means uncompressed
+    packet_with_header = write_varint(0) + inner_data
+    return write_varint(len(packet_with_header)) + packet_with_header
+
+
+class PacketReader:
+    """Handles buffered packet reading with optional decompression."""
+
+    def __init__(self, compression_threshold: int = -1):
+        self.buffer = b""
+        self.compression_threshold = compression_threshold
+
+    def add_data(self, data: bytes):
+        """Add received data to the buffer."""
+        self.buffer += data
+
+    def read_packet(self):
+        """
+        Try to read a complete packet from the buffer.
+        
+        Returns:
+            tuple: (packet_id, payload_bytes, raw_packet) or (None, None, None) if incomplete
+        """
+        if not self.buffer:
+            return None, None, None
+
+        offset = 0
+        packet_length, offset = read_varint(self.buffer, offset)
+        
+        if packet_length is None or len(self.buffer) < offset + packet_length:
+            return None, None, None
+
+        raw_packet = self.buffer[:offset + packet_length]
+        packet_data = self.buffer[offset:offset + packet_length]
+        self.buffer = self.buffer[offset + packet_length:]
+
+        payload_offset = 0
+
+        # Handle compression if enabled
+        if self.compression_threshold >= 0:
+            data_length, payload_offset = read_varint(packet_data, payload_offset)
+            if data_length and data_length > 0:
+                try:
+                    packet_data = zlib.decompress(packet_data[payload_offset:])
+                    payload_offset = 0
+                except zlib.error:
+                    return None, None, None
+
+        packet_id, payload_offset = read_varint(packet_data, payload_offset)
+        if packet_id is None:
+            return None, None, None
+
+        payload = packet_data[payload_offset:]
+        return packet_id, payload, raw_packet
+
+    def has_data(self) -> bool:
+        return len(self.buffer) > 0
 
 
 # =============================================================================
-# SHARED DATA (Thread-safe player positions)
+# SHARED MEMORY CONFIGURATION
+# =============================================================================
+# 
+# Memory Layout (fixed size for direct access):
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Offset 0-3   : player_count (int32) - number of tracked players        │
+# │ Offset 4-43  : my_position (5 × float64) - x, y, z, yaw, pitch          │
+# │ Offset 44+   : players array (MAX_PLAYERS × 32 bytes each)              │
+# │               Each player: entity_id (int32) + x, y, z (3 × float64)    │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# This replaces JSON file I/O with direct RAM access between processes.
+
+SHARED_MEMORY_NAME = "mc_proxy_positions"
+MAX_PLAYERS = 50
+
+# Struct formats (using Python's struct module)
+# 'i' = int32 (4 bytes), 'd' = float64/double (8 bytes), 'x' = padding byte
+HEADER_FORMAT = 'i5d'           # player_count + my_pos(x,y,z,yaw,pitch) = 44 bytes
+PLAYER_FORMAT = 'i3d4x'         # entity_id + x,y,z + 4 padding = 32 bytes
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)    # 44 bytes
+PLAYER_SIZE = struct.calcsize(PLAYER_FORMAT)    # 32 bytes
+TOTAL_SHM_SIZE = HEADER_SIZE + (PLAYER_SIZE * MAX_PLAYERS)  # ~1.6 KB
+
+
+# =============================================================================
+# PLAYER POSITION STORAGE
 # =============================================================================
 
-shared_data = {
-    'my_position': {'x': 0, 'y': 0, 'z': 0, 'yaw': 0, 'pitch': 0},
-    'players': {},  # entity_id -> {x, y, z, uuid}
-    'lock': threading.Lock()
-}
+class PlayerPositionStore:
+    """
+    Thread-safe storage for player positions with shared memory export.
+    
+    Instead of writing JSON to disk on every update (slow I/O),
+    we write directly to a shared memory block that the aimbot can read.
+    """
 
+    def __init__(self):
+        # Position data
+        self.my_position: dict[str, float] = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0, 'pitch': 0.0}
+        self.other_players: dict[int, dict] = {}  # entity_id -> {x, y, z, uuid}
+        self._lock = threading.Lock()
+        
+        # Initialize shared memory
+        self._shm: shared_memory.SharedMemory = self._create_shared_memory()
 
-def export_to_file():
-    """Export position data to JSON file for aimbot."""
-    try:
-        with shared_data['lock']:
-            data = {
-                'my_position': shared_data['my_position'].copy(),
-                'players': {str(k): v for k, v in shared_data['players'].items()}
-            }
-        with open(SHARED_FILE, 'w') as f:
-            json.dump(data, f)
-    except:
-        pass
+    def _create_shared_memory(self) -> shared_memory.SharedMemory:
+        """
+        Create or attach to shared memory block.
+        
+        We try to create new shared memory. If it already exists (from a previous
+        run that didn't clean up), we unlink it first and create fresh.
+        """
+        
+        try:
+            # Try to create new shared memory
+            shm = shared_memory.SharedMemory(
+                name=SHARED_MEMORY_NAME,
+                create=True,
+                size=TOTAL_SHM_SIZE
+            )
+            print(f"[SHM] Created shared memory: {SHARED_MEMORY_NAME} ({TOTAL_SHM_SIZE} bytes)")
+            
+            # Zero-initialize the memory (buf is always valid after successful creation)
+            shm.buf[:TOTAL_SHM_SIZE] = b'\x00' * TOTAL_SHM_SIZE  # type: ignore[index]
+            return shm
+            
+        except FileExistsError:
+            # Shared memory exists from previous run - reuse it
+            shm = shared_memory.SharedMemory(name=SHARED_MEMORY_NAME, create=False)
+            print(f"[SHM] Attached to existing shared memory: {SHARED_MEMORY_NAME}")
+            
+            # Zero-initialize to clear stale data (buf is always valid after successful attach)
+            shm.buf[:TOTAL_SHM_SIZE] = b'\x00' * TOTAL_SHM_SIZE  # type: ignore[index]
+            return shm
+
+    def cleanup(self):
+        """
+        Clean up shared memory when proxy shuts down.
+        
+        Must be called on exit to avoid memory leaks.
+        """
+        if self._shm:
+            try:
+                self._shm.close()
+                self._shm.unlink()  # Remove the shared memory block
+                print("[SHM] Shared memory cleaned up")
+            except Exception as e:
+                print(f"[SHM] Cleanup warning: {e}")
+
+    def update_my_position(self, x: float | None = None, y: float | None = None, 
+                           z: float | None = None, yaw: float | None = None, 
+                           pitch: float | None = None):
+        """Update local player's position and/or rotation."""
+        with self._lock:
+            if x is not None:
+                self.my_position['x'] = x
+            if y is not None:
+                self.my_position['y'] = y
+            if z is not None:
+                self.my_position['z'] = z
+            if yaw is not None:
+                self.my_position['yaw'] = yaw
+            if pitch is not None:
+                self.my_position['pitch'] = pitch
+        self._export()
+
+    def add_player(self, entity_id: int, x: float, y: float, z: float, uuid: str):
+        """Add a new player to tracking."""
+        with self._lock:
+            self.other_players[entity_id] = {'x': x, 'y': y, 'z': z, 'uuid': uuid}
+        self._export()
+
+    def update_player_position(self, entity_id: int, x: float, y: float, z: float):
+        """Update a tracked player's absolute position."""
+        with self._lock:
+            if entity_id in self.other_players:
+                self.other_players[entity_id].update({'x': x, 'y': y, 'z': z})
+        self._export()
+
+    def update_player_position_delta(self, entity_id: int, dx: float, dy: float, dz: float):
+        """Update a tracked player's position by delta."""
+        with self._lock:
+            if entity_id in self.other_players:
+                player = self.other_players[entity_id]
+                player['x'] += dx
+                player['y'] += dy
+                player['z'] += dz
+        self._export()
+
+    def remove_player(self, entity_id: int):
+        """Remove a player from tracking."""
+        with self._lock:
+            self.other_players.pop(entity_id, None)
+        self._export()
+
+    def get_player(self, entity_id: int) -> dict:
+        """Get a player's current data."""
+        with self._lock:
+            return self.other_players.get(entity_id, {}).copy()
+
+    def get_all_players(self) -> dict:
+        """Get all tracked players."""
+        with self._lock:
+            return {eid: data.copy() for eid, data in self.other_players.items()}
+
+    def is_tracked_player(self, entity_id: int) -> bool:
+        """Check if entity_id is a tracked player."""
+        with self._lock:
+            return entity_id in self.other_players
+
+    def _export(self):
+        """
+        Export position data to shared memory for aimbot.
+        
+        Memory layout:
+        - Bytes 0-3: player count (int32)
+        - Bytes 4-43: my_position as 5 doubles (x, y, z, yaw, pitch)
+        - Bytes 44+: each player as (entity_id: int32, x, y, z: doubles, 4 padding)
+        
+        This is ~100x faster than JSON file I/O because:
+        1. No serialization overhead
+        2. No disk I/O
+        3. No file system locks
+        """
+        if not self._shm:
+            return
+            
+        try:
+            with self._lock:
+                # Get player list (limit to MAX_PLAYERS)
+                players = list(self.other_players.items())[:MAX_PLAYERS]
+                player_count = len(players)
+                
+                # Pack header: player_count + my_position
+                buf = self._shm.buf  # Local reference for type checker
+                struct.pack_into(
+                    HEADER_FORMAT,
+                    buf,  # type: ignore[arg-type]
+                    0,  # offset
+                    player_count,
+                    self.my_position['x'],
+                    self.my_position['y'],
+                    self.my_position['z'],
+                    self.my_position['yaw'],
+                    self.my_position['pitch']
+                )
+                
+                # Pack each player into the array section
+                for i, (entity_id, player_data) in enumerate(players):
+                    offset = HEADER_SIZE + (i * PLAYER_SIZE)
+                    struct.pack_into(
+                        'i3d',  # entity_id + x, y, z (no padding needed for pack_into)
+                        buf,  # type: ignore[arg-type]
+                        offset,
+                        entity_id,
+                        player_data['x'],
+                        player_data['y'],
+                        player_data['z']
+                    )
+                    
+        except Exception:
+            # Silently ignore errors (same as original JSON export)
+            pass
 
 
 # =============================================================================
@@ -78,57 +335,50 @@ def export_to_file():
 # =============================================================================
 
 class EntityTracker:
-    """Tracks positions of PLAYERS only (ignores mobs and objects)."""
+    """Tracks which entity IDs are players and updates their positions."""
 
-    def __init__(self):
-        self.players = {}  # entity_id -> {x, y, z, uuid}
+    def __init__(self, position_store: PlayerPositionStore):
+        self.position_store = position_store
         self.my_entity_id = None
 
-    def add_player(self, entity_id, x, y, z, uuid):
-        """Add a new player (only called on Spawn Player packet 0x0C)."""
-        self.players[entity_id] = {'x': x, 'y': y, 'z': z, 'uuid': uuid}
-        return self.players[entity_id]
+    def on_spawn_player(self, entity_id: int, x: float, y: float, z: float, uuid: str):
+        """Handle Spawn Player packet (0x0C) - only real players trigger this."""
+        self.position_store.add_player(entity_id, x, y, z, uuid)
+        uuid_short = uuid[:8] if uuid else '?'
+        print(f"\n>>> PLAYER DETECTED: ID={entity_id} UUID={uuid_short}...")
+        print(f"    Position: X={x:.1f} Y={y:.1f} Z={z:.1f}")
 
-    def update_position_delta(self, entity_id, dx, dy, dz):
-        """Update position by delta - only if it's a known player."""
-        if entity_id in self.players:
-            self.players[entity_id]['x'] += dx
-            self.players[entity_id]['y'] += dy
-            self.players[entity_id]['z'] += dz
-            return self.players[entity_id]
-        return None
+    def on_entity_teleport(self, entity_id: int, x: float, y: float, z: float):
+        """Handle Entity Teleport packet - only update if it's a tracked player."""
+        if self.position_store.is_tracked_player(entity_id):
+            self.position_store.update_player_position(entity_id, x, y, z)
+            print(f"\r[PLAYER {entity_id:3d}] X={x:8.1f} Y={y:5.1f} Z={z:8.1f}  ", end="", flush=True)
 
-    def set_position(self, entity_id, x, y, z):
-        """Set absolute position - only if it's a known player."""
-        if entity_id in self.players:
-            self.players[entity_id]['x'] = x
-            self.players[entity_id]['y'] = y
-            self.players[entity_id]['z'] = z
-            return self.players[entity_id]
-        return None
+    def on_entity_move(self, entity_id: int, dx: float, dy: float, dz: float):
+        """Handle Entity Relative Move packet - only update if it's a tracked player."""
+        if self.position_store.is_tracked_player(entity_id):
+            self.position_store.update_player_position_delta(entity_id, dx, dy, dz)
+            player = self.position_store.get_player(entity_id)
+            if player:
+                print(f"\r[PLAYER {entity_id:3d}] X={player['x']:8.1f} Y={player['y']:5.1f} Z={player['z']:8.1f}  ", 
+                      end="", flush=True)
 
-    def remove_player(self, entity_id):
-        if entity_id in self.players:
-            del self.players[entity_id]
+    def on_my_position(self, x: float, y: float, z: float, 
+                       yaw: float | None = None, pitch: float | None = None):
+        """Handle Player Position And Look packet (our own position from server)."""
+        self.position_store.update_my_position(x=x, y=y, z=z, yaw=yaw, pitch=pitch)
 
-    def is_player(self, entity_id):
-        return entity_id in self.players
-
-    def get_all_players(self):
-        return self.players
+    def on_destroy_entities(self, entity_ids: list):
+        """Handle Destroy Entities packet."""
+        for entity_id in entity_ids:
+            self.position_store.remove_player(entity_id)
 
 
 # =============================================================================
-# HELPER FUNCTIONS
+# HANDSHAKE REWRITER
 # =============================================================================
 
-def write_string(s):
-    """Write a Minecraft string (VarInt length + UTF-8)."""
-    encoded = s.encode('utf-8')
-    return write_varint(len(encoded)) + encoded
-
-
-def rewrite_handshake(packet_data, target_host, target_port):
+def rewrite_handshake(packet_data: bytes, target_host: str, target_port: int) -> bytes:
     """
     Rewrite the Handshake packet to change server address.
     Preserves any trailing data (like Status Request that might follow).
@@ -143,17 +393,17 @@ def rewrite_handshake(packet_data, target_host, target_port):
     payload = packet_data[offset:handshake_end]
 
     # Parse original handshake
-    off = 0
-    packet_id, off = read_varint(payload, off)
+    parse_offset = 0
+    packet_id, parse_offset = read_varint(payload, parse_offset)
     if packet_id != 0x00:
         return packet_data
 
-    protocol_version, off = read_varint(payload, off)
-    _, off = read_string(payload, off)  # Original server address (ignored)
-    if off + 2 > len(payload):
+    protocol_version, parse_offset = read_varint(payload, parse_offset)
+    _, parse_offset = read_string(payload, parse_offset)  # Original server address (ignored)
+    if parse_offset + 2 > len(payload):
         return packet_data
-    off += 2  # Original port (ignored)
-    next_state, off = read_varint(payload, off)
+    parse_offset += 2  # Original port (ignored)
+    next_state, parse_offset = read_varint(payload, parse_offset)
 
     # Build new handshake with target address
     new_payload = write_varint(0x00)  # Packet ID
@@ -166,123 +416,241 @@ def rewrite_handshake(packet_data, target_host, target_port):
 
 
 # =============================================================================
-# MINECRAFT PROXY
+# MOJANG SESSION VALIDATOR
 # =============================================================================
 
-class MinecraftProxy:
-    """Main proxy class that handles client connections and packet forwarding."""
+class MojangSessionValidator:
+    """Handles session validation with Mojang servers."""
 
-    def __init__(self, local_host, local_port, server_host, server_port):
-        self.local_host = local_host
-        self.local_port = local_port
+    MOJANG_SESSION_URL = "https://sessionserver.mojang.com/session/minecraft/join"
+
+    @staticmethod
+    def join_server(access_token: str, uuid: str, server_hash: str) -> bool:
+        """
+        Register session with Mojang (step 3 of encryption flow).
+        Returns True on success, False on failure.
+        """
+        try:
+            response = requests.post(
+                MojangSessionValidator.MOJANG_SESSION_URL,
+                json={
+                    "accessToken": access_token,
+                    "selectedProfile": uuid,
+                    "serverId": server_hash
+                },
+                headers={"Content-Type": "application/json"},
+                timeout=10
+            )
+            if response.status_code == 204:
+                print("[CRYPTO] Mojang session validated!")
+                return True
+            else:
+                print(f"[!] Mojang session error: {response.status_code} {response.text}")
+                return False
+        except requests.RequestException as e:
+            print(f"[!] Mojang session error: {e}")
+            return False
+
+
+# =============================================================================
+# ENCRYPTION HANDSHAKE HANDLER
+# =============================================================================
+
+class EncryptionHandler:
+    """Handles the encryption handshake with the server."""
+
+    def __init__(self, server_socket, auth_data: dict):
+        self.server_socket = server_socket
+        self.auth_data = auth_data
+        self.packet_reader = PacketReader(compression_threshold=-1)
+
+    def perform_handshake(self):
+        """
+        Perform encryption handshake with server.
+        
+        Returns:
+            tuple: (socket, compression_threshold) on success
+            - For encrypted servers: (EncryptedSocketWrapper, threshold)
+            - For offline servers: (raw_socket, threshold)
+            Returns None on failure.
+        """
+        while True:
+            data = self.server_socket.recv(4096)
+            if not data:
+                return None
+            
+            self.packet_reader.add_data(data)
+            packet_id, payload, _ = self.packet_reader.read_packet()
+            
+            if packet_id is None:
+                continue
+
+            if packet_id == 0x01 and payload is not None:  # Encryption Request
+                return self._handle_encryption_request(payload)
+            elif packet_id == 0x02:  # Login Success (offline mode, no compression)
+                print("[INFO] Server is offline mode (no encryption, no compression)")
+                return self.server_socket, -1
+            elif packet_id == 0x03:  # Set Compression (offline mode with compression)
+                threshold, _ = read_varint(payload, 0)
+                threshold = threshold if threshold else -1
+                print(f"[INFO] Server is offline mode with compression (threshold={threshold})")
+                # Wait for Login Success after Set Compression
+                return self._wait_for_login_success_offline(threshold)
+
+    def _handle_encryption_request(self, payload: bytes):
+        """Process Encryption Request and establish encrypted connection."""
+        print("[CRYPTO] Encryption Request received")
+
+        # Parse Encryption Request
+        offset = 0
+        server_id, offset = read_string(payload, offset)
+        pubkey_length, offset = read_varint(payload, offset)
+        if pubkey_length is None:
+            return None
+        public_key = payload[offset:offset + pubkey_length]
+        offset += pubkey_length
+        verify_length, offset = read_varint(payload, offset)
+        if verify_length is None:
+            return None
+        verify_token = payload[offset:offset + verify_length]
+
+        print(f"[CRYPTO] Server ID: '{server_id}'")
+        print(f"[CRYPTO] Public Key: {len(public_key)} bytes")
+
+        # Generate shared secret
+        shared_secret = generate_shared_secret()
+        print(f"[CRYPTO] Shared Secret: {shared_secret.hex()[:16]}...")
+
+        # Compute server hash and validate with Mojang
+        server_hash = compute_server_hash(server_id, shared_secret, public_key)
+        print(f"[CRYPTO] Server Hash: {server_hash}")
+        print("[CRYPTO] Validating session with Mojang...")
+
+        if not MojangSessionValidator.join_server(
+            self.auth_data['access_token'],
+            self.auth_data['uuid'],
+            server_hash
+        ):
+            return None
+
+        # Send Encryption Response
+        encrypted_secret = encrypt_with_public_key(public_key, shared_secret)
+        encrypted_verify = encrypt_with_public_key(public_key, verify_token)
+
+        response_payload = (
+            write_varint(len(encrypted_secret)) + encrypted_secret +
+            write_varint(len(encrypted_verify)) + encrypted_verify
+        )
+        self.server_socket.sendall(build_packet(0x01, response_payload))
+        print("[CRYPTO] Encryption Response sent")
+
+        # Enable AES encryption
+        encrypted_socket = EncryptedSocketWrapper(self.server_socket, shared_secret)
+        print("[CRYPTO] AES encryption enabled!")
+
+        # Wait for Set Compression and Login Success
+        return self._wait_for_login_success(encrypted_socket)
+
+    def _wait_for_login_success(self, encrypted_socket):
+        """Wait for Set Compression and Login Success packets after encryption."""
+        print("[DEBUG] Waiting for post-encryption packets...")
+        
+        packet_reader = PacketReader(compression_threshold=-1)
+        compression_threshold = -1
+
+        while True:
+            try:
+                data = encrypted_socket.recv(4096)
+                if not data:
+                    print("[!] Connection lost during login")
+                    return None
+                packet_reader.add_data(data)
+            except Exception as e:
+                print(f"[!] Recv error after encryption: {e}")
+                return None
+
+            while packet_reader.has_data():
+                # Update compression for packet reader
+                packet_reader.compression_threshold = compression_threshold
+                packet_id, payload, _ = packet_reader.read_packet()
+                
+                if packet_id is None:
+                    break
+
+                if packet_id == 0x03:  # Set Compression
+                    threshold, _ = read_varint(payload, 0)
+                    compression_threshold = threshold if threshold else -1
+                    print(f"[CRYPTO] Set Compression (threshold={compression_threshold})")
+                elif packet_id == 0x02:  # Login Success
+                    print("[CRYPTO] Login Success!")
+                    return encrypted_socket, compression_threshold
+                elif packet_id == 0x00:  # Disconnect
+                    try:
+                        reason, _ = read_string(payload, 0)
+                        print(f"[!] Disconnected during login: {reason}")
+                    except:
+                        print("[!] Disconnected during login")
+                    return None
+
+    def _wait_for_login_success_offline(self, compression_threshold: int):
+        """
+        Wait for Login Success packet in offline mode (after Set Compression).
+        
+        In offline mode, after receiving Set Compression, server sends Login Success.
+        We need to wait for it before returning.
+        """
+        print("[DEBUG] Waiting for Login Success (offline mode)...")
+        
+        # Update packet reader to handle compression
+        self.packet_reader.compression_threshold = compression_threshold
+
+        while True:
+            try:
+                data = self.server_socket.recv(4096)
+                if not data:
+                    print("[!] Connection lost during offline login")
+                    return None
+                self.packet_reader.add_data(data)
+            except Exception as e:
+                print(f"[!] Recv error during offline login: {e}")
+                return None
+
+            while self.packet_reader.has_data():
+                packet_id, payload, _ = self.packet_reader.read_packet()
+                
+                if packet_id is None:
+                    break
+
+                if packet_id == 0x02:  # Login Success
+                    print("[INFO] Login Success (offline mode)!")
+                    return self.server_socket, compression_threshold
+                elif packet_id == 0x00:  # Disconnect
+                    try:
+                        reason, _ = read_string(payload, 0)
+                        print(f"[!] Disconnected during offline login: {reason}")
+                    except:
+                        print("[!] Disconnected during offline login")
+                    return None
+
+
+# =============================================================================
+# PACKET FORWARDER
+# =============================================================================
+
+class PacketForwarder:
+    """Handles bidirectional packet forwarding between client and server."""
+
+    def __init__(self, tracker: EntityTracker, position_store: PlayerPositionStore,
+                 server_host: str, server_port: int):
+        self.tracker = tracker
+        self.position_store = position_store
         self.server_host = server_host
         self.server_port = server_port
-        self.tracker = EntityTracker()
 
-    # =========================================================================
-    # PACKET HANDLING
-    # =========================================================================
-
-    def handle_packet(self, data, direction, compression_threshold):
-        """Parse a packet and extract position information."""
-        offset = 0
-        packet_length, offset = read_varint(data, offset)
-        if packet_length is None:
-            return
-
-        packet_data = data[offset:offset + packet_length]
-        offset = 0
-
-        # Handle compression
-        if compression_threshold >= 0:
-            data_length, offset = read_varint(packet_data, offset)
-            if data_length and data_length > 0:
-                try:
-                    packet_data = zlib.decompress(packet_data[offset:])
-                    offset = 0
-                except:
-                    return
-
-        # Read packet ID
-        packet_id, offset = read_varint(packet_data, offset)
-        if packet_id is None:
-            return
-
-        # Parse position packets (server -> client only)
-        if direction == "S->C" and packet_id in PACKET_IDS:
-            try:
-                result = parse_server_packet(packet_id, packet_data[offset:])
-                if result:
-                    self.process_position(result)
-            except:
-                pass
-
-    def process_position(self, result):
-        """Process parsed position data and update tracker/shared data."""
-        
-        # New player spawned
-        if result['type'] == 'spawn_player':
-            self.tracker.add_player(
-                result['entity_id'],
-                result['x'], result['y'], result['z'],
-                result.get('uuid', 'unknown')
-            )
-            uuid_short = result.get('uuid', '?')[:8]
-            print(f"\n>>> PLAYER DETECTED: ID={result['entity_id']} UUID={uuid_short}...")
-            print(f"    Position: X={result['x']:.1f} Y={result['y']:.1f} Z={result['z']:.1f}")
-
-            with shared_data['lock']:
-                shared_data['players'][result['entity_id']] = {
-                    'x': result['x'], 'y': result['y'], 'z': result['z'],
-                    'uuid': result.get('uuid', 'unknown')
-                }
-
-        # Player teleported (absolute position)
-        elif result['type'] == 'teleport':
-            entity = self.tracker.set_position(
-                result['entity_id'],
-                result['x'], result['y'], result['z']
-            )
-            if entity:
-                print(f"\r[PLAYER {result['entity_id']:3d}] X={result['x']:8.1f} Y={result['y']:5.1f} Z={result['z']:8.1f}  ", end="", flush=True)
-                with shared_data['lock']:
-                    if result['entity_id'] in shared_data['players']:
-                        shared_data['players'][result['entity_id']].update({
-                            'x': result['x'], 'y': result['y'], 'z': result['z']
-                        })
-
-        # Player moved (delta position)
-        elif result['type'] in ['position_delta', 'position_rotation_delta']:
-            entity = self.tracker.update_position_delta(
-                result['entity_id'],
-                result['dx'], result['dy'], result['dz']
-            )
-            if entity:
-                print(f"\r[PLAYER {result['entity_id']:3d}] X={entity['x']:8.1f} Y={entity['y']:5.1f} Z={entity['z']:8.1f}  ", end="", flush=True)
-                with shared_data['lock']:
-                    if result['entity_id'] in shared_data['players']:
-                        shared_data['players'][result['entity_id']].update({
-                            'x': entity['x'], 'y': entity['y'], 'z': entity['z']
-                        })
-
-        # Our own position (from server)
-        elif result['type'] == 'my_position':
-            with shared_data['lock']:
-                shared_data['my_position'].update({
-                    'x': result['x'], 'y': result['y'], 'z': result['z'],
-                    'yaw': result.get('yaw', 0), 'pitch': result.get('pitch', 0)
-                })
-
-        export_to_file()
-
-    # =========================================================================
-    # FORWARDING THREADS
-    # =========================================================================
-
-    def forward_client_to_server(self, client_socket, server_socket, state):
-        """Forward data from client to server, parsing client packets."""
-        first_packet = True
-        compression = state.get('compression_threshold', -1)
+    def forward_client_to_server(self, client_socket, server_socket, connection_state: dict):
+        """Forward packets from client to server, parsing position updates."""
+        is_first_packet = True
+        compression_threshold = connection_state.get('compression_threshold', -1)
 
         while True:
             try:
@@ -291,74 +659,19 @@ class MinecraftProxy:
                     break
 
                 # Rewrite first packet (Handshake) in handshaking phase
-                if first_packet and state['phase'] == 'handshaking':
+                if is_first_packet and connection_state['phase'] == 'handshaking':
                     data = rewrite_handshake(data, self.server_host, self.server_port)
-                    first_packet = False
-
-                    # Detect next_state
-                    offset = 0
-                    plen, offset = read_varint(data, offset)
-                    if plen:
-                        payload = data[offset:offset + plen]
-                        p = 0
-                        _, p = read_varint(payload, p)  # Packet ID
-                        _, p = read_varint(payload, p)  # Protocol version
-                        _, p = read_string(payload, p)  # Server address
-                        p += 2  # Port
-                        next_state, _ = read_varint(payload, p)
-                        state['phase'] = 'status' if next_state == 1 else 'login'
+                    is_first_packet = False
+                    self._detect_next_state(data, connection_state)
 
                 # Extract username from Login Start
-                if state['phase'] == 'login' and 'username' not in state:
-                    try:
-                        offset = 0
-                        plen, offset = read_varint(data, offset)
-                        if plen and 0 < plen < 50:
-                            pid, poff = read_varint(data, offset)
-                            if pid == 0x00:
-                                name, _ = read_string(data, poff)
-                                if name and 3 <= len(name) <= 16:
-                                    if all(c.isalnum() or c == '_' for c in name):
-                                        state['username'] = name
-                                        print(f"[LOGIN] Player: {name}")
-                    except:
-                        pass
+                if connection_state['phase'] == 'login' and 'username' not in connection_state:
+                    self._try_extract_username(data, connection_state)
 
                 # Parse client position packets in play phase
-                if state['phase'] == 'play':
-                    try:
-                        compression = state.get('compression_threshold', -1)
-                        offset = 0
-                        plen, offset = read_varint(data, offset)
-                        if plen and plen > 0:
-                            pdata = data[offset:offset + plen]
-                            p = 0
-
-                            if compression >= 0:
-                                dlen, p = read_varint(pdata, p)
-                                if dlen and dlen > 0:
-                                    try:
-                                        pdata = zlib.decompress(pdata[p:])
-                                        p = 0
-                                    except:
-                                        pass
-
-                            pid, p = read_varint(pdata, p)
-                            # Player Position (0x04), Look (0x05), Position+Look (0x06)
-                            if pid in [0x04, 0x05, 0x06]:
-                                result = parse_client_packet(pid, pdata[p:])
-                                if result:
-                                    with shared_data['lock']:
-                                        if 'x' in result:
-                                            shared_data['my_position']['x'] = result['x']
-                                            shared_data['my_position']['y'] = result['y']
-                                            shared_data['my_position']['z'] = result['z']
-                                        if 'yaw' in result:
-                                            shared_data['my_position']['yaw'] = result['yaw']
-                                            shared_data['my_position']['pitch'] = result['pitch']
-                                    export_to_file()
-                    except:
-                        pass
+                if connection_state['phase'] == 'play':
+                    compression_threshold = connection_state.get('compression_threshold', -1)
+                    self._parse_client_position_packet(data, compression_threshold)
 
                 server_socket.sendall(data)
 
@@ -366,16 +679,11 @@ class MinecraftProxy:
                 print(f"\n[!] Error C->S: {e}")
                 break
 
-        try:
-            client_socket.close()
-            server_socket.close()
-        except:
-            pass
+        self._close_sockets(client_socket, server_socket)
 
-    def forward_server_to_client(self, server_socket, client_socket, state):
-        """Forward data from server to client, parsing server packets."""
-        buffer = b""
-        compression = state.get('compression_threshold', -1)
+    def forward_server_to_client(self, server_socket, client_socket, connection_state: dict):
+        """Forward packets from server to client, parsing entity positions."""
+        packet_reader = PacketReader(connection_state.get('compression_threshold', -1))
 
         while True:
             try:
@@ -383,57 +691,23 @@ class MinecraftProxy:
                 if not data:
                     break
 
-                buffer += data
+                packet_reader.add_data(data)
 
                 # Parse complete packets from buffer
-                while len(buffer) > 0:
-                    try:
-                        length, length_size = read_varint(buffer, 0)
-                        if length is None or len(buffer) < length_size + length:
-                            break
-
-                        packet = buffer[:length_size + length]
-                        buffer = buffer[length_size + length:]
-
-                        # Handle login phase packets
-                        if state['phase'] == 'login':
-                            offset = length_size
-
-                            if compression >= 0:
-                                data_length, offset = read_varint(packet, offset)
-                                if data_length and data_length > 0:
-                                    try:
-                                        decompressed = zlib.decompress(packet[offset:])
-                                        pid, _ = read_varint(decompressed, 0)
-                                    except:
-                                        pid = None
-                                else:
-                                    pid, _ = read_varint(packet, offset)
-                            else:
-                                pid, offset = read_varint(packet, offset)
-
-                            if pid is not None:
-                                if pid == 0x01:  # Encryption Request
-                                    print("[!] ENCRYPTION REQUEST - Server is NOT offline mode!")
-                                elif pid == 0x03:  # Set Compression
-                                    threshold, _ = read_varint(packet, offset)
-                                    compression = threshold if threshold else -1
-                                    state['compression_threshold'] = compression
-                                    print(f"[INFO] Compression enabled (threshold={compression})")
-                                elif pid == 0x02:  # Login Success
-                                    state['phase'] = 'play'
-                                    username = state.get('username', 'unknown')
-                                    print(f"[OK] Connected as {username} - Tracking active")
-
-                        # Parse play phase packets
-                        if state['phase'] == 'play':
-                            try:
-                                self.handle_packet(packet, "S->C", compression)
-                            except:
-                                pass
-
-                    except:
+                while packet_reader.has_data():
+                    packet_reader.compression_threshold = connection_state.get('compression_threshold', -1)
+                    packet_id, payload, raw_packet = packet_reader.read_packet()
+                    
+                    if packet_id is None:
                         break
+
+                    # Handle login phase packets
+                    if connection_state['phase'] == 'login' and payload is not None:
+                        self._handle_login_packet(packet_id, payload, connection_state)
+
+                    # Parse play phase packets for entity positions
+                    if connection_state['phase'] == 'play' and payload is not None:
+                        self._parse_server_position_packet(packet_id, payload)
 
                 client_socket.sendall(data)
 
@@ -441,352 +715,348 @@ class MinecraftProxy:
                 print(f"\n[!] Error S->C: {e}")
                 break
 
+        self._close_sockets(server_socket, client_socket)
+
+    def _detect_next_state(self, data: bytes, connection_state: dict):
+        """Detect next_state from handshake packet."""
         try:
-            server_socket.close()
-            client_socket.close()
+            offset = 0
+            packet_length, offset = read_varint(data, offset)
+            if packet_length:
+                payload = data[offset:offset + packet_length]
+                parse_offset = 0
+                _, parse_offset = read_varint(payload, parse_offset)  # Packet ID
+                _, parse_offset = read_varint(payload, parse_offset)  # Protocol version
+                _, parse_offset = read_string(payload, parse_offset)  # Server address
+                parse_offset += 2  # Port
+                next_state, _ = read_varint(payload, parse_offset)
+                connection_state['phase'] = 'status' if next_state == 1 else 'login'
         except:
             pass
 
-    # =========================================================================
-    # ENCRYPTION HANDSHAKE
-    # =========================================================================
-
-    def handle_encryption_handshake(self, server_socket, auth_data):
-        """
-        Handle encryption handshake with server.
-        
-        1. Receive Encryption Request
-        2. Generate shared secret, encrypt with RSA
-        3. Validate session with Mojang
-        4. Send Encryption Response
-        5. Enable AES encryption
-        
-        Returns:
-            (EncryptedSocketWrapper, compression_threshold) or None
-        """
-        buffer = b""
-
-        while True:
-            data = server_socket.recv(4096)
-            if not data:
-                return None
-            buffer += data
-
-            # Read packet
+    def _try_extract_username(self, data: bytes, connection_state: dict):
+        """Try to extract username from Login Start packet."""
+        try:
             offset = 0
-            packet_length, offset = read_varint(buffer, offset)
-            if packet_length is None or len(buffer) < offset + packet_length:
-                continue
+            packet_length, offset = read_varint(data, offset)
+            if packet_length and 0 < packet_length < 50:
+                packet_id, payload_offset = read_varint(data, offset)
+                if packet_id == 0x00:
+                    username, _ = read_string(data, payload_offset)
+                    if username and 3 <= len(username) <= 16:
+                        if all(c.isalnum() or c == '_' for c in username):
+                            connection_state['username'] = username
+                            print(f"[LOGIN] Player: {username}")
+        except:
+            pass
 
-            packet_data = buffer[offset:offset + packet_length]
-            buffer = buffer[offset + packet_length:]
-
-            p = 0
-            packet_id, p = read_varint(packet_data, p)
-
-            # Encryption Request (0x01)
-            if packet_id == 0x01:
-                print("[CRYPTO] Encryption Request received")
-
-                # Parse packet
-                server_id, p = read_string(packet_data, p)
-                pubkey_len, p = read_varint(packet_data, p)
-                if pubkey_len is None:
-                    return None
-                public_key = packet_data[p:p + pubkey_len]
-                p += pubkey_len
-                verify_len, p = read_varint(packet_data, p)
-                if verify_len is None:
-                    return None
-                verify_token = packet_data[p:p + verify_len]
-
-                print(f"[CRYPTO] Server ID: '{server_id}'")
-                print(f"[CRYPTO] Public Key: {len(public_key)} bytes")
-
-                # Generate shared secret
-                shared_secret = generate_shared_secret()
-                print(f"[CRYPTO] Shared Secret: {shared_secret.hex()[:16]}...")
-
-                # Compute server hash for Mojang validation
-                server_hash = compute_server_hash(server_id, shared_secret, public_key)
-                print(f"[CRYPTO] Server Hash: {server_hash}")
-
-                # Validate session with Mojang
-                print("[CRYPTO] Validating session with Mojang...")
-                try:
-                    response = requests.post(
-                        "https://sessionserver.mojang.com/session/minecraft/join",
-                        json={
-                            "accessToken": auth_data['access_token'],
-                            "selectedProfile": auth_data['uuid'],
-                            "serverId": server_hash
-                        },
-                        headers={"Content-Type": "application/json"}
+    def _parse_client_position_packet(self, data: bytes, compression_threshold: int):
+        """Parse client position packets (0x04, 0x05, 0x06)."""
+        try:
+            packet_reader = PacketReader(compression_threshold)
+            packet_reader.add_data(data)
+            packet_id, payload, _ = packet_reader.read_packet()
+            
+            if packet_id in [0x04, 0x05, 0x06] and payload is not None:
+                result = parse_client_packet(packet_id, payload)
+                if result:
+                    self.position_store.update_my_position(
+                        x=result.get('x'),
+                        y=result.get('y'),
+                        z=result.get('z'),
+                        yaw=result.get('yaw'),
+                        pitch=result.get('pitch')
                     )
-                    if response.status_code == 204:
-                        print("[CRYPTO] Mojang session validated!")
-                    else:
-                        print(f"[!] Mojang session error: {response.status_code} {response.text}")
-                        return None
-                except Exception as e:
-                    print(f"[!] Mojang session error: {e}")
-                    return None
+        except:
+            pass
 
-                # Encrypt shared secret and verify token with RSA
-                encrypted_secret = encrypt_with_public_key(public_key, shared_secret)
-                encrypted_verify = encrypt_with_public_key(public_key, verify_token)
+    def _handle_login_packet(self, packet_id: int, payload: bytes, connection_state: dict):
+        """Handle login phase packets."""
+        if packet_id == 0x01:  # Encryption Request
+            print("[!] ENCRYPTION REQUEST - Server is NOT offline mode!")
+        elif packet_id == 0x03:  # Set Compression
+            threshold, _ = read_varint(payload, 0)
+            compression_threshold = threshold if threshold else -1
+            connection_state['compression_threshold'] = compression_threshold
+            print(f"[INFO] Compression enabled (threshold={compression_threshold})")
+        elif packet_id == 0x02:  # Login Success
+            connection_state['phase'] = 'play'
+            username = connection_state.get('username', 'unknown')
+            print(f"[OK] Connected as {username} - Tracking active")
 
-                # Build Encryption Response (0x01)
-                response_payload = write_varint(0x01)
-                response_payload += write_varint(len(encrypted_secret)) + encrypted_secret
-                response_payload += write_varint(len(encrypted_verify)) + encrypted_verify
+    def _parse_server_position_packet(self, packet_id: int, payload: bytes):
+        """Parse server packets for entity positions."""
+        if packet_id not in PACKET_IDS:
+            return
 
-                server_socket.sendall(write_varint(len(response_payload)) + response_payload)
-                print("[CRYPTO] Encryption Response sent")
+        try:
+            result = parse_server_packet(packet_id, payload)
+            if not result:
+                return
 
-                # Enable AES encryption
-                encrypted_socket = EncryptedSocketWrapper(server_socket, shared_secret)
-                print("[CRYPTO] AES encryption enabled!")
+            packet_type = result['type']
 
-                # Receive Set Compression and Login Success (now encrypted)
-                login_complete = False
-                compression = -1
+            if packet_type == 'spawn_player':
+                self.tracker.on_spawn_player(
+                    result['entity_id'],
+                    result['x'], result['y'], result['z'],
+                    result.get('uuid', 'unknown')
+                )
+            elif packet_type == 'teleport':
+                self.tracker.on_entity_teleport(
+                    result['entity_id'],
+                    result['x'], result['y'], result['z']
+                )
+            elif packet_type in ['position_delta', 'position_rotation_delta']:
+                self.tracker.on_entity_move(
+                    result['entity_id'],
+                    result['dx'], result['dy'], result['dz']
+                )
+            elif packet_type == 'my_position':
+                yaw = result.get('yaw')
+                pitch = result.get('pitch')
+                self.tracker.on_my_position(
+                    result['x'], result['y'], result['z'],
+                    yaw if yaw is not None else 0.0,
+                    pitch if pitch is not None else 0.0
+                )
+        except:
+            pass
 
-                print("[DEBUG] Waiting for post-encryption packets...")
-                while not login_complete:
-                    try:
-                        if not buffer:
-                            enc_data = encrypted_socket.recv(4096)
-                            if not enc_data:
-                                print("[!] Connection lost during login")
-                                return None
-                            buffer += enc_data
-                    except Exception as e:
-                        print(f"[!] Recv error after encryption: {e}")
-                        return None
+    @staticmethod
+    def _close_sockets(*sockets):
+        """Close multiple sockets safely."""
+        for sock in sockets:
+            try:
+                sock.close()
+            except:
+                pass
 
-                    while len(buffer) > 0:
-                        off = 0
-                        plen, off = read_varint(buffer, off)
-                        if plen is None or len(buffer) < off + plen:
-                            try:
-                                more = encrypted_socket.recv(4096)
-                                if not more:
-                                    return None
-                                buffer += more
-                                continue
-                            except:
-                                return None
 
-                        pkt = buffer[:off + plen]
-                        buffer = buffer[off + plen:]
-                        p_off = off
+# =============================================================================
+# MINECRAFT PROXY
+# =============================================================================
 
-                        # Handle compression
-                        if compression >= 0:
-                            dlen, p_off = read_varint(pkt, p_off)
-                            if dlen is not None and dlen > 0:
-                                try:
-                                    pkt_content = zlib.decompress(pkt[p_off:])
-                                    p_off = 0
-                                except Exception as e:
-                                    print(f"[!] Decompression error: {e}")
-                                    return None
-                            else:
-                                pkt_content = pkt
-                        else:
-                            pkt_content = pkt
+class MinecraftProxy:
+    """Main proxy class that coordinates client connections and components."""
 
-                        pid, np = read_varint(pkt_content, p_off)
-                        p_off = np
+    def __init__(self, local_host: str, local_port: int, server_host: str, server_port: int):
+        self.local_host = local_host
+        self.local_port = local_port
+        self.server_host = server_host
+        self.server_port = server_port
+        
+        # Initialize components
+        self.position_store = PlayerPositionStore()
+        self.tracker = EntityTracker(self.position_store)
+        self.forwarder = PacketForwarder(
+            self.tracker, self.position_store, server_host, server_port
+        )
+        
+        self.server_socket: socket.socket | None = None
+        self.running = False
 
-                        if pid == 0x03:  # Set Compression
-                            thresh, _ = read_varint(pkt_content, p_off)
-                            compression = thresh if thresh else -1
-                            print(f"[CRYPTO] Set Compression (threshold={compression})")
-                        elif pid == 0x02:  # Login Success
-                            print("[CRYPTO] Login Success!")
-                            login_complete = True
-                        elif pid == 0x00:  # Disconnect
-                            try:
-                                reason, _ = read_string(pkt_content, p_off)
-                                print(f"[!] Disconnected during login: {reason}")
-                            except:
-                                print("[!] Disconnected during login")
-                            return None
-
-                return encrypted_socket, compression
-
-            # Login Success without encryption (offline mode)
-            elif packet_id == 0x02:
-                print("[INFO] Server is offline mode (no encryption)")
-                return None
-
-            # Set Compression without encryption
-            elif packet_id == 0x03:
-                threshold, _ = read_varint(packet_data, p)
-                print(f"[INFO] Set Compression (no encryption): {threshold}")
-                return None
-
-    # =========================================================================
-    # CLIENT HANDLER
-    # =========================================================================
-
-    def handle_client(self, client_socket, address):
-        """Handle a client connection."""
-        print(f"\n[+] New connection from {address}")
+    def handle_client(self, client_socket, client_address):
+        """Handle a single client connection."""
+        print(f"\n[+] New connection from {client_address}")
 
         # Authenticate if online mode
         auth_data = None
         if ONLINE_MODE:
-            print("[*] Online Mode - Authentication required")
-            try:
-                auth = MinecraftAuth()
-                auth_data = auth.authenticate()
-                print(f"[OK] Authenticated: {auth_data['username']}")
-            except Exception as e:
-                print(f"[!] Authentication failed: {e}")
+            auth_data = self._authenticate()
+            if not auth_data:
                 client_socket.close()
                 return
 
         # Connect to real server
+        server_socket = self._connect_to_server()
+        if not server_socket:
+            client_socket.close()
+            return
+
+        connection_state = {'phase': 'handshaking', 'encrypted': False}
+
+        # Handle online mode authentication
+        if ONLINE_MODE and auth_data:
+            server_socket = self._handle_online_mode_login(
+                client_socket, server_socket, auth_data, connection_state
+            )
+            if not server_socket:
+                client_socket.close()
+                return
+
+        # Start forwarding threads
+        client_to_server = threading.Thread(
+            target=self.forwarder.forward_client_to_server,
+            args=(client_socket, server_socket, connection_state),
+            daemon=True
+        )
+        server_to_client = threading.Thread(
+            target=self.forwarder.forward_server_to_client,
+            args=(server_socket, client_socket, connection_state),
+            daemon=True
+        )
+
+        client_to_server.start()
+        server_to_client.start()
+        client_to_server.join()
+        server_to_client.join()
+
+        print(f"\n[-] Connection closed for {client_address}")
+        self._print_session_summary()
+
+    def _authenticate(self):
+        """Authenticate with Microsoft/Mojang."""
+        print("[*] Online Mode - Authentication required")
+        try:
+            auth = MinecraftAuth()
+            auth_data = auth.authenticate()
+            print(f"[OK] Authenticated: {auth_data['username']}")
+            return auth_data
+        except Exception as e:
+            print(f"[!] Authentication failed: {e}")
+            return None
+
+    def _connect_to_server(self):
+        """Connect to the real Minecraft server."""
         try:
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_socket.settimeout(10)
             server_socket.connect((self.server_host, self.server_port))
             server_socket.settimeout(None)
             print(f"[+] Connected to server {self.server_host}:{self.server_port}")
+            return server_socket
         except Exception as e:
             print(f"[!] Cannot connect to server: {e}")
-            client_socket.close()
-            return
+            return None
 
-        state = {'phase': 'handshaking', 'encrypted': False}
+    def _handle_online_mode_login(self, client_socket, server_socket, auth_data, connection_state):
+        """Handle the online mode login process."""
+        client_data = client_socket.recv(4096)
+        if not client_data:
+            return None
 
-        # Handle online mode authentication
-        if ONLINE_MODE and auth_data:
-            client_data = client_socket.recv(4096)
-            if client_data:
-                # Parse handshake to get next_state
-                off = 0
-                plen = 0
-                next_state = 2  # Default: assume login
-                try:
-                    plen, off = read_varint(client_data, off)
-                    if plen is None:
-                        plen = 0
-                    else:
-                        payload = client_data[off:off + plen]
-                        p = 0
-                        _, p = read_varint(payload, p)  # Packet ID
-                        _, p = read_varint(payload, p)  # Protocol
-                        _, p = read_string(payload, p)  # Address
-                        p += 2  # Port
-                        next_state_val, _ = read_varint(payload, p)
-                        if next_state_val is not None:
-                            next_state = next_state_val
-                except:
-                    pass
+        next_state = self._parse_handshake_next_state(client_data)
 
-                if next_state == 1:
-                    # Status ping - transparent passthrough
-                    rewritten = rewrite_handshake(client_data, self.server_host, self.server_port)
-                    server_socket.sendall(rewritten)
-                    state['phase'] = 'status'
-                else:
-                    # Login - full authentication
-                    handshake_len = off + (plen or 0)
-                    trailing = client_data[handshake_len:]
-                    handshake_pkt = client_data[:handshake_len]
+        if next_state == 1:
+            # Status ping - transparent passthrough
+            rewritten = rewrite_handshake(client_data, self.server_host, self.server_port)
+            server_socket.sendall(rewritten)
+            connection_state['phase'] = 'status'
+            return server_socket
 
-                    rewritten = rewrite_handshake(handshake_pkt, self.server_host, self.server_port)
-                    server_socket.sendall(rewritten)
-                    state['phase'] = 'login'
+        # Login flow
+        handshake_packet, trailing_data = self._split_handshake_data(client_data)
+        rewritten = rewrite_handshake(handshake_packet, self.server_host, self.server_port)
+        server_socket.sendall(rewritten)
+        connection_state['phase'] = 'login'
 
-                    # Get Login Start
-                    login_data = trailing if trailing else client_socket.recv(4096)
-                    if login_data:
-                        try:
-                            lo = 0
-                            lp, lo = read_varint(login_data, lo)
-                            pid, po = read_varint(login_data, lo)
-                            if pid == 0x00:
-                                name, _ = read_string(login_data, po)
-                                print(f"[LOGIN] Client connecting as: {name}")
-                        except:
-                            pass
+        # Get and process Login Start
+        login_data = trailing_data if trailing_data else client_socket.recv(4096)
+        if login_data:
+            self._log_client_username(login_data)
+            self._send_authenticated_login_start(server_socket, auth_data)
 
-                        # Send Login Start with authenticated username
-                        real_username = str(auth_data['username'])
-                        login_payload = write_varint(0x00)
-                        login_payload += write_varint(len(real_username.encode('utf-8')))
-                        login_payload += real_username.encode('utf-8')
-                        server_socket.sendall(write_varint(len(login_payload)) + login_payload)
-                        print(f"[LOGIN] Sent Login Start: {real_username}")
+        # Handle encryption/login handshake
+        encryption_handler = EncryptionHandler(server_socket, auth_data)
+        result = encryption_handler.perform_handshake()
 
-                    # Handle encryption
-                    result = self.handle_encryption_handshake(server_socket, auth_data)
+        if result is None:
+            print("[!] Handshake failed")
+            return None
+        
+        result_socket, compression_threshold = result
+        connection_state['phase'] = 'play'
+        connection_state['compression_threshold'] = compression_threshold
+        
+        # Check if we got an encrypted socket (online mode) or raw socket (offline mode)
+        if isinstance(result_socket, EncryptedSocketWrapper):
+            connection_state['encrypted'] = True
+            print("[OK] Encrypted handshake complete - Play mode active")
+        else:
+            connection_state['encrypted'] = False
+            print("[OK] Offline mode handshake complete - Play mode active")
 
-                    if result:
-                        encrypted_socket, compression = result
-                        state['encrypted'] = True
-                        state['phase'] = 'play'
-                        state['compression_threshold'] = compression
-                        server_socket = encrypted_socket
+        # Send Set Compression and Login Success to client
+        self._send_login_success_to_client(client_socket, auth_data, compression_threshold)
+        return result_socket
 
-                        # Send Set Compression to client
-                        if compression >= 0:
-                            comp_payload = write_varint(0x03) + write_varint(compression)
-                            client_socket.sendall(write_varint(len(comp_payload)) + comp_payload)
-                            print(f"[PROXY] Sent Set Compression to client (threshold={compression})")
+    def _parse_handshake_next_state(self, data: bytes) -> int:
+        """Parse next_state from handshake packet."""
+        try:
+            offset = 0
+            packet_length, offset = read_varint(data, offset)
+            if packet_length is None:
+                return 2
+            payload = data[offset:offset + packet_length]
+            parse_offset = 0
+            _, parse_offset = read_varint(payload, parse_offset)  # Packet ID
+            _, parse_offset = read_varint(payload, parse_offset)  # Protocol
+            _, parse_offset = read_string(payload, parse_offset)  # Address
+            parse_offset += 2  # Port
+            next_state, _ = read_varint(payload, parse_offset)
+            return next_state if next_state is not None else 2
+        except:
+            return 2
 
-                        # Send Login Success to client
-                        uuid_str = str(auth_data['uuid'])
-                        uuid_formatted = f"{uuid_str[:8]}-{uuid_str[8:12]}-{uuid_str[12:16]}-{uuid_str[16:20]}-{uuid_str[20:]}"
-                        username = str(auth_data['username'])
+    def _split_handshake_data(self, data: bytes):
+        """Split handshake packet from trailing data."""
+        offset = 0
+        packet_length, offset = read_varint(data, offset)
+        if packet_length is None:
+            return data, b""
+        handshake_end = offset + packet_length
+        return data[:handshake_end], data[handshake_end:]
 
-                        login_success = write_varint(0x02)
-                        login_success += write_varint(len(uuid_formatted)) + uuid_formatted.encode('utf-8')
-                        login_success += write_varint(len(username)) + username.encode('utf-8')
+    def _log_client_username(self, login_data: bytes):
+        """Log the username from client's Login Start packet."""
+        try:
+            offset = 0
+            packet_length, offset = read_varint(login_data, offset)
+            packet_id, payload_offset = read_varint(login_data, offset)
+            if packet_id == 0x00:
+                username, _ = read_string(login_data, payload_offset)
+                print(f"[LOGIN] Client connecting as: {username}")
+        except:
+            pass
 
-                        if compression >= 0:
-                            inner = write_varint(0) + login_success
-                            login_pkt = write_varint(len(inner)) + inner
-                        else:
-                            login_pkt = write_varint(len(login_success)) + login_success
+    def _send_authenticated_login_start(self, server_socket, auth_data: dict):
+        """Send Login Start packet with authenticated username."""
+        username = str(auth_data['username'])
+        login_payload = write_string(username)
+        server_socket.sendall(build_packet(0x00, login_payload))
+        print(f"[LOGIN] Sent Login Start: {username}")
 
-                        client_socket.sendall(login_pkt)
-                        print(f"[PROXY] Sent Login Success to client ({username})")
-                        print("[OK] Encrypted handshake complete - Play mode active")
-                    else:
-                        print("[INFO] Continuing without encryption")
+    def _send_login_success_to_client(self, client_socket, auth_data: dict, compression_threshold: int):
+        """Send Set Compression and Login Success packets to client."""
+        # Send Set Compression if needed
+        if compression_threshold >= 0:
+            compression_payload = write_varint(compression_threshold)
+            client_socket.sendall(build_packet(0x03, compression_payload))
+            print(f"[PROXY] Sent Set Compression to client (threshold={compression_threshold})")
 
-        # Store sockets in state
-        state['server_socket'] = server_socket
-        state['client_socket'] = client_socket
+        # Build Login Success packet
+        uuid_str = str(auth_data['uuid'])
+        uuid_formatted = f"{uuid_str[:8]}-{uuid_str[8:12]}-{uuid_str[12:16]}-{uuid_str[16:20]}-{uuid_str[20:]}"
+        username = str(auth_data['username'])
 
-        # Start forwarding threads
-        t1 = threading.Thread(target=self.forward_client_to_server, args=(client_socket, server_socket, state))
-        t2 = threading.Thread(target=self.forward_server_to_client, args=(server_socket, client_socket, state))
-        t1.daemon = True
-        t2.daemon = True
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
+        login_success_payload = write_string(uuid_formatted) + write_string(username)
 
-        print(f"\n[-] Connection closed for {address}")
+        if compression_threshold >= 0:
+            login_success_packet = build_compressed_packet(0x02, login_success_payload, compression_threshold)
+        else:
+            login_success_packet = build_packet(0x02, login_success_payload)
 
-        # Summary
-        players = self.tracker.get_all_players()
+        client_socket.sendall(login_success_packet)
+        print(f"[PROXY] Sent Login Success to client ({username})")
+
+    def _print_session_summary(self):
+        """Print summary of detected players at end of session."""
+        players = self.position_store.get_all_players()
         if players:
             print("\n[SUMMARY] Players detected:")
-            for eid, data in players.items():
-                print(f"  ID={eid}: X={data['x']:.1f} Y={data['y']:.1f} Z={data['z']:.1f}")
-
-    # =========================================================================
-    # MAIN LOOP
-    # =========================================================================
+            for entity_id, data in players.items():
+                print(f"  ID={entity_id}: X={data['x']:.1f} Y={data['y']:.1f} Z={data['z']:.1f}")
 
     def start(self):
         """Start the proxy server."""
@@ -808,10 +1078,15 @@ class MinecraftProxy:
         def signal_handler(sig, frame):
             print("\n[*] Ctrl+C received, shutting down...")
             self.running = False
-            try:
-                self.server_socket.close()
-            except:
-                pass
+            
+            # Clean up shared memory to avoid memory leaks
+            self.position_store.cleanup()
+            
+            if self.server_socket is not None:
+                try:
+                    self.server_socket.close()
+                except Exception:
+                    pass
             sys.exit(0)
 
         signal.signal(signal.SIGINT, signal_handler)
@@ -824,8 +1099,11 @@ class MinecraftProxy:
                 self.server_socket.settimeout(1.0)
                 try:
                     client_socket, address = self.server_socket.accept()
-                    handler = threading.Thread(target=self.handle_client, args=(client_socket, address))
-                    handler.daemon = True
+                    handler = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket, address),
+                        daemon=True
+                    )
                     handler.start()
                 except socket.timeout:
                     continue

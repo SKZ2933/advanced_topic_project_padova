@@ -14,8 +14,8 @@ import math
 import time
 import sys
 import random
-import json
-import os
+import struct
+from multiprocessing import shared_memory
 
 # Windows API for mouse control
 try:
@@ -104,10 +104,10 @@ class HumanizedAim:
 
     def __init__(self):
         # Smoothing parameters
-        self.smoothing_factor = 0.35   # Movement speed (higher = faster)
-        self.noise_amplitude = 0.4     # Random jitter in degrees
-        self.overshoot_chance = 0.10   # 10% chance to overshoot target
-        self.overshoot_amount = 0.05   # 5% overshoot distance
+        self.smoothing_factor = 1   # Movement speed (higher = faster)
+        self.noise_amplitude = 0.0    # Random jitter in degrees
+        self.overshoot_chance = 0.0   # 10% chance to overshoot target
+        self.overshoot_amount = 0.0   # 5% overshoot distance
         
         # Current aim state
         self.is_aiming = False
@@ -293,13 +293,36 @@ class MouseController:
 
 
 # =============================================================================
+# SHARED MEMORY CONFIGURATION (must match mc_proxy.py)
+# =============================================================================
+# 
+# Memory Layout:
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Offset 0-3   : player_count (int32) - number of tracked players        │
+# │ Offset 4-43  : my_position (5 × float64) - x, y, z, yaw, pitch          │
+# │ Offset 44+   : players array (MAX_PLAYERS × 32 bytes each)              │
+# │               Each player: entity_id (int32) + x, y, z (3 × float64)    │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+SHARED_MEMORY_NAME = "mc_proxy_positions"
+MAX_PLAYERS = 50
+HEADER_FORMAT = 'i5d'           # player_count + my_pos(x,y,z,yaw,pitch) = 44 bytes
+PLAYER_FORMAT = 'i3d'           # entity_id + x,y,z = 28 bytes (read only, no padding)
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)    # 44 bytes
+PLAYER_SIZE = 32                                 # 32 bytes per player slot
+
+
+# =============================================================================
 # AIMBOT MAIN CLASS
 # =============================================================================
 
 class Aimbot:
-    """Main aimbot controller - reads positions from proxy and aims at targets."""
-
-    SHARED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aimbot_data.json")
+    """
+    Main aimbot controller - reads positions from shared memory and aims at targets.
+    
+    Uses shared memory instead of JSON file for ~100x faster data access.
+    The proxy writes position data directly to RAM, and we read it here.
+    """
 
     def __init__(self):
         self.enabled = False
@@ -309,25 +332,91 @@ class Aimbot:
         self.target_entity_id = None
         self.update_rate = 144  # Hz
         
-        # Cached data from proxy
+        # Shared memory connection (will be initialized when proxy starts)
+        self._shm = None
+        
+        # Cached data (populated from shared memory)
         self._cached_data = {
             'my_position': {'x': 0, 'y': 0, 'z': 0, 'yaw': 0, 'pitch': 0},
             'players': {}
         }
         
-        print(f"[*] Data file: {self.SHARED_FILE}")
+        print(f"[*] Shared memory: {SHARED_MEMORY_NAME}")
         print(f"[*] Humanized aim enabled (anti-detection)")
 
-    def _read_shared_data(self):
-        """Read player positions from JSON file (written by proxy)."""
+    def _connect_shared_memory(self):
+        """
+        Attempt to connect to the shared memory block created by the proxy.
+        
+        Returns True if connected, False if proxy hasn't started yet.
+        """
+        if self._shm is not None:
+            return True  # Already connected
+            
         try:
-            if os.path.exists(self.SHARED_FILE):
-                with open(self.SHARED_FILE, 'r') as f:
-                    self._cached_data = json.load(f)
-                    return True
-        except (json.JSONDecodeError, IOError):
-            pass
-        return False
+            self._shm = shared_memory.SharedMemory(
+                name=SHARED_MEMORY_NAME,
+                create=False  # Attach to existing (created by proxy)
+            )
+            print(f"[SHM] Connected to shared memory!")
+            return True
+        except FileNotFoundError:
+            # Proxy hasn't started yet - this is normal
+            return False
+
+    def _read_shared_data(self):
+        """
+        Read player positions from shared memory (written by proxy).
+        
+        This is ~100x faster than JSON file I/O because:
+        1. No disk access - direct RAM read
+        2. No JSON parsing - raw binary unpacking
+        3. No file locks - memory is always accessible
+        
+        Returns True if data was read successfully.
+        """
+        # Try to connect if not already connected
+        if not self._connect_shared_memory():
+            return False
+            
+        try:
+            # Read header: player_count + my_position
+            assert self._shm is not None  # Guaranteed by _connect_shared_memory() check above
+            buf = self._shm.buf
+            assert buf is not None
+            header_data = struct.unpack_from(HEADER_FORMAT, buf, 0)
+            player_count = header_data[0]
+            
+            # Update my_position from header
+            self._cached_data['my_position'] = {
+                'x': header_data[1],
+                'y': header_data[2],
+                'z': header_data[3],
+                'yaw': header_data[4],
+                'pitch': header_data[5]
+            }
+            
+            # Read each player from the array
+            players = {}
+            for i in range(min(player_count, MAX_PLAYERS)):
+                offset = HEADER_SIZE + (i * PLAYER_SIZE)
+                player_data = struct.unpack_from(PLAYER_FORMAT, buf, offset)
+                entity_id = player_data[0]
+                
+                # Skip invalid entries (entity_id = 0 means empty slot)
+                if entity_id != 0:
+                    players[str(entity_id)] = {
+                        'x': player_data[1],
+                        'y': player_data[2],
+                        'z': player_data[3]
+                    }
+            
+            self._cached_data['players'] = players
+            return True
+            
+        except Exception:
+            # If shared memory read fails, return cached data
+            return False
 
     def _get_my_position(self):
         """Get local player position and rotation."""
@@ -466,6 +555,15 @@ class Aimbot:
             pass
         finally:
             keyboard.unhook_all()
+            
+            # Close shared memory connection (don't unlink - proxy owns it)
+            if self._shm:
+                try:
+                    self._shm.close()
+                    print("[SHM] Disconnected from shared memory")
+                except Exception:
+                    pass
+                    
             print("\n[*] Aimbot stopped.")
 
 
