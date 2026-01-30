@@ -24,7 +24,7 @@ import sys
 import requests
 
 from mc_protocol import (
-    read_varint, write_varint, parse_packet, parse_client_packet,
+    read_varint, write_varint, parse_server_packet, parse_client_packet,
     PACKET_IDS, read_string
 )
 from auth_microsoft import MinecraftAuth
@@ -211,7 +211,7 @@ class MinecraftProxy:
         # Parse position packets (server -> client only)
         if direction == "S->C" and packet_id in PACKET_IDS:
             try:
-                result = parse_packet(packet_id, packet_data[offset:])
+                result = parse_server_packet(packet_id, packet_data[offset:])
                 if result:
                     self.process_position(result)
             except:
