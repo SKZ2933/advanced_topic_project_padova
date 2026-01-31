@@ -42,7 +42,7 @@ LOCAL_HOST = "0.0.0.0"
 LOCAL_PORT = 25566
 SERVER_HOST = "mc.dikingvps.com"
 SERVER_PORT = 25565
-ONLINE_MODE = True  # True = premium server (authentication required)
+ONLINE_MODE = False  # True = premium server (authentication required)
 
 
 # =============================================================================
@@ -141,11 +141,12 @@ SHARED_MEMORY_NAME = "mc_proxy_positions"
 MAX_PLAYERS = 50
 
 # Struct formats (using Python's struct module)
-# 'i' = int32 (4 bytes), 'd' = float64/double (8 bytes), 'x' = padding byte
-HEADER_FORMAT = 'i5d'           # player_count + my_pos(x,y,z,yaw,pitch) = 44 bytes
-PLAYER_FORMAT = 'i3d4x'         # entity_id + x,y,z + 4 padding = 32 bytes
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)    # 44 bytes
-PLAYER_SIZE = struct.calcsize(PLAYER_FORMAT)    # 32 bytes
+# Use '<' prefix for little-endian, no padding (consistent across platforms)
+# 'i' = int32 (4 bytes), 'd' = float64/double (8 bytes)
+HEADER_FORMAT = '<i5d'          # player_count + my_pos(x,y,z,yaw,pitch) = 44 bytes
+PLAYER_WRITE_FORMAT = '<i3d'    # entity_id + x,y,z = 28 bytes (what we write)
+HEADER_SIZE = 44                # Fixed: 4 + 5*8 = 44 bytes
+PLAYER_SIZE = 32                # 32 bytes per player slot (28 data + 4 padding)
 TOTAL_SHM_SIZE = HEADER_SIZE + (PLAYER_SIZE * MAX_PLAYERS)  # ~1.6 KB
 
 
@@ -316,7 +317,7 @@ class PlayerPositionStore:
                 for i, (entity_id, player_data) in enumerate(players):
                     offset = HEADER_SIZE + (i * PLAYER_SIZE)
                     struct.pack_into(
-                        'i3d',  # entity_id + x, y, z (no padding needed for pack_into)
+                        PLAYER_WRITE_FORMAT,
                         buf,  # type: ignore[arg-type]
                         offset,
                         entity_id,

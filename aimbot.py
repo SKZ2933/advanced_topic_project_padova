@@ -104,10 +104,10 @@ class HumanizedAim:
 
     def __init__(self):
         # Smoothing parameters
-        self.smoothing_factor = 1   # Movement speed (higher = faster)
-        self.noise_amplitude = 0.0    # Random jitter in degrees
-        self.overshoot_chance = 0.0   # 10% chance to overshoot target
-        self.overshoot_amount = 0.0   # 5% overshoot distance
+        self.smoothing_factor = 0.35   # Movement speed (higher = faster)
+        self.noise_amplitude = 0.4     # Random jitter in degrees
+        self.overshoot_chance = 0.10   # 10% chance to overshoot target
+        self.overshoot_amount = 0.05   # 5% overshoot distance
         
         # Current aim state
         self.is_aiming = False
@@ -306,10 +306,11 @@ class MouseController:
 
 SHARED_MEMORY_NAME = "mc_proxy_positions"
 MAX_PLAYERS = 50
-HEADER_FORMAT = 'i5d'           # player_count + my_pos(x,y,z,yaw,pitch) = 44 bytes
-PLAYER_FORMAT = 'i3d'           # entity_id + x,y,z = 28 bytes (read only, no padding)
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)    # 44 bytes
-PLAYER_SIZE = 32                                 # 32 bytes per player slot
+# Use '<' prefix for little-endian, no padding (consistent across platforms)
+HEADER_FORMAT = '<i5d'          # player_count + my_pos(x,y,z,yaw,pitch) = 44 bytes
+PLAYER_FORMAT = '<i3d'          # entity_id + x,y,z = 28 bytes
+HEADER_SIZE = 44                # Fixed: 4 + 5*8 = 44 bytes
+PLAYER_SIZE = 32                # 32 bytes per player slot (28 data + 4 padding)
 
 
 # =============================================================================
@@ -456,7 +457,8 @@ class Aimbot:
             self.target_entity_id = None
             return
         
-        player_ids = sorted(players.keys())
+        # Sort by integer value for consistent ordering
+        player_ids = sorted(players.keys(), key=lambda x: int(x))
         
         if self.target_entity_id is None or self.target_entity_id not in player_ids:
             self.target_entity_id = player_ids[0]
@@ -464,10 +466,12 @@ class Aimbot:
             idx = player_ids.index(self.target_entity_id)
             self.target_entity_id = player_ids[(idx + 1) % len(player_ids)]
         
-        target = players.get(self.target_entity_id)
-        if target:
-            uuid_short = target.get('uuid', '?')[:8]
-            print(f"[TARGET] Player ID={self.target_entity_id} UUID={uuid_short}...")
+        # Reset humanizer state so it recognizes the new target
+        self.humanizer.last_target_id = None
+        self.humanizer.is_aiming = False
+        self.humanizer.accumulated_movement = 0
+        
+        print(f"\n[TARGET] Player ID={self.target_entity_id}")
 
     def _aim_at_target(self):
         """Perform one aim cycle."""
